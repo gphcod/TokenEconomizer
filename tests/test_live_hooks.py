@@ -351,8 +351,9 @@ def _stuck(host, n=40):
 def test_the_guard_redirects_then_tells_the_person_how_to_stop_on_every_agent(
         env, repo, host, mode, setting):
     """One ladder everywhere: a redirect to the model, then one notice to the person with the
-    agent's way to stop the turn. The plugin never stops it -- `stop` is read as `nudge`."""
-    env = dict(env, TE_MODE=mode, TE_LOOPGUARD=setting)
+    agent's way to stop the turn. The plugin never stops it -- `stop` is read as `nudge`. A run
+    nobody watches is guarded only under `scripted_sessions=learn`; the default leaves it be."""
+    env = dict(env, TE_MODE=mode, TE_LOOPGUARD=setting, TE_SCRIPTED_SESSIONS="learn")
     green = [("Read", {"file_path": "/r/a.py"}, "ok")] * 8
     for k in range(5):
         _guard_turn(env, repo, "s", f"g{k}", green, host)
@@ -999,8 +1000,8 @@ def test_pi_learns_from_its_own_session_files_and_injects_at_the_next_start(env,
 
 def test_pi_print_mode_counts_as_headless_for_the_stop_hint(env, repo):
     """Pi says its mode through the extension (`TE_PI_MODE`); a print-mode notice names the
-    headless way to stop."""
-    penv = dict(env, TE_PI_MODE="print")
+    headless way to stop (a run nobody watches is guarded under `scripted_sessions=learn`)."""
+    penv = dict(env, TE_PI_MODE="print", TE_SCRIPTED_SESSIONS="learn")
     for k in range(5):
         _guard_turn(penv, repo, "p", f"g{k}",
                     [("read", {"path": "/r/a.py"}, {"content": "ok"})] * 8, "pi")

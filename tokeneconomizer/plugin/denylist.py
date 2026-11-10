@@ -39,11 +39,14 @@ Rules common to all three:
 Checking what an applied list did, and measuring a request with and without it, is
 `toolcheck`'s job.
 """
+import contextlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import threading
 import time
 
 from .. import trace
@@ -119,6 +122,33 @@ def _guard_target(repo_root, path):
     if os.path.islink(path) or os.path.commonpath([root, parent]) != root:
         raise RuntimeError(f"refusing to write {path}: it is, or goes through, a symlink that "
                            "leads out of the repository")
+    # Inside the repository too, every folder on the way must be a plain one. A symlink there
+    # (`.claude -> .agents`) would land the file in a folder the exclude rule does not cover,
+    # and on Windows git checks such a symlink out as a small file, which no folder can be
+    # made over.
+    top = os.path.abspath(repo_root)
+    rel = os.path.relpath(os.path.dirname(os.path.abspath(path)), top)
+    cur = top
+    for part in ([] if rel == os.curdir else rel.split(os.sep)):
+        cur = os.path.join(cur, part)
+        if os.path.lexists(cur) and (_is_link(cur) or not os.path.isdir(cur)):
+            raise RuntimeError(f"refusing to write {path}: {cur} is not a plain folder (a "
+                               "symlink, or a file where a folder should be, such as a symlink "
+                               "git checked out as a file)")
+
+
+def _is_link(path):
+    """A symlink, or on Windows a junction: by the reparse tag `lstat` reports (Python 3.8+),
+    since `os.path.isjunction` arrived only in 3.12 and other reparse points (a cloud file's
+    placeholder) are plain folders."""
+    if os.path.islink(path):
+        return True
+    try:
+        tag = getattr(os.lstat(path), "st_reparse_tag", 0)
+    except OSError:
+        return False
+    return tag in (getattr(stat, "IO_REPARSE_TAG_SYMLINK", -1),
+                   getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", -1))
 
 
 def write_json(path, obj):
@@ -208,12 +238,14 @@ def kept_for(store, repo_root, host="claude"):
 
 
 def set_kept(store, repo_root, host, add=(), remove=()):
-    """Mark entries as given back by the person (`restore`), or no longer (`apply` by name)."""
-    doc = store.read(APPLIED) or {}
-    kept = kept_by_path(doc)
-    path = _canon(settings_path(repo_root, host))
-    kept[path] = sorted((set(kept.get(path) or []) | set(add)) - set(remove))
-    write_applied(store, applied_by_path(doc), kept)
+    """Mark entries as given back by the person (`restore`), or no longer (`apply` by name).
+    The record it rewrites is the one `apply` and `restore` write, so it takes their lock."""
+    with one_writer(store):
+        doc = store.read(APPLIED) or {}
+        kept = kept_by_path(doc)
+        path = _canon(settings_path(repo_root, host))
+        kept[path] = sorted((set(kept.get(path) or []) | set(add)) - set(remove))
+        write_applied(store, applied_by_path(doc), kept)
 
 
 def applied(store, path=None):
@@ -255,8 +287,15 @@ def _apply_json_list(repo_root, items, store, host):
     lst.extend(added)
     # Recorded before written, as `restore` writes before it forgets: whichever write fails, the
     # record still covers every entry of the plugin's in the file, so `restore` can take it back.
-    _record(store, set(applied(store, path)) | set(added), path)
-    write_json(path, data)
+    # A write that fails put nothing in the file, so the record goes back to what it was: it
+    # must never claim tools were left out that were not.
+    before = set(applied(store, path))
+    _record(store, before | set(added), path)
+    try:
+        write_json(path, data)
+    except BaseException:
+        _record(store, before, path)
+        raise
     if created:
         _exclude_from_git(repo_root, _SETTINGS[host])
     return added
@@ -530,20 +569,54 @@ def codex_project_trusted(repo_root, env=None):
 
 
 # ---- dispatch ------------------------------------------------------------------------------
+LOCK_WAIT_S = 10.0       # how long a write waits for another write to the same deny list
+_HELD = threading.local()   # the stores whose deny-list lock this thread holds, and how deep
+
+
+@contextlib.contextmanager
+def one_writer(store):
+    """The settings file and its record change together, one writer at a time: the fold's,
+    the CLI's and a detached `apply-pending` all come here. A caller that changes the record in
+    more than one step (`apply`, then `set_kept`) holds it across them; inside, it is taken
+    again without waiting."""
+    held = getattr(_HELD, "depth", None)
+    if held is None:
+        held = _HELD.depth = {}
+    key = os.path.abspath(store.base)
+    if held.get(key):
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+    with store.locked("denylist", timeout=LOCK_WAIT_S) as got:
+        if not got:
+            raise RuntimeError("another change to this repository's deny list is under way; "
+                               "try again in a moment")
+        held[key] = 1
+        try:
+            yield
+        finally:
+            held.pop(key, None)
+
+
 def apply(repo_root, tools, store, host="claude"):
     """Write `tools` (tools, capabilities or MCP servers, by host). Returns those newly added."""
-    if host == "codex":
-        return _apply_codex(repo_root, tools, store)
-    return _apply_json_list(repo_root, tools, store, host)
+    with one_writer(store):
+        if host == "codex":
+            return _apply_codex(repo_root, tools, store)
+        return _apply_json_list(repo_root, tools, store, host)
 
 
 def restore(repo_root, store, tools=None, host="claude", refuse_tracked=False):
     """Remove entries this plugin added (all of them, or just `tools`). Returns removed.
     `refuse_tracked`: a restore the plugin does by itself raises RuntimeError rather than edit a
     Codex config that is committed (the other agents' files are per-user)."""
-    if host == "codex":
-        return _restore_codex(repo_root, store, tools, refuse_tracked=refuse_tracked)
-    return _restore_json_list(repo_root, store, tools, host)
+    with one_writer(store):
+        if host == "codex":
+            return _restore_codex(repo_root, store, tools, refuse_tracked=refuse_tracked)
+        return _restore_json_list(repo_root, store, tools, host)
 
 
 def copilot_server_proposal(raw, catalog, used, servers):

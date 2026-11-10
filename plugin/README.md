@@ -807,6 +807,7 @@ first session there ends.
 | `pi_cli` | `""` | Pi only: the `pi` the plugin's own calls run; empty: the first on PATH |
 | `shadow` | `false` | decide and log everything, act on nothing |
 | `mode` | `auto` | `interactive` or `headless` to override what the plugin detects |
+| `scripted_sessions` | `skip` | a session nobody watches (`codex exec`, `claude -p`, an SDK script; every session under `mode=headless`): `skip` learns nothing from it (no facts, no tool pruning evidence, no envelope turns) and never judges or redirects it, but still gives it the injected facts and counts its cost apart in `status`; `learn` treats it as any other |
 
 **Where settings live, and when they apply.** For one session, an environment variable wins:
 `TE_` plus the setting's name in capitals (`TE_MICROSKILLS`, `TE_TOOLPRUNE_EVIDENCE`,

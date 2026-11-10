@@ -68,7 +68,13 @@ person can tune by hand:
                                    `projects` folders (or config folders holding one) beside
                                    `$CLAUDE_CONFIG_DIR/projects` (else `~/.claude/projects`);
                                    on Codex, Codex homes (or folders of rollouts) beside
-                                   `$CODEX_HOME` (else `~/.codex`).
+                                   `$CODEX_HOME` (else `~/.codex`);
+  * scripted_sessions           -- a session nobody watches (`codex exec`, `claude -p`, an SDK
+                                   script; `mode=headless` makes every session one): "skip"
+                                   (default) learns nothing from it -- no micro-skills, no tool
+                                   pruning evidence, no envelope turns -- and never judges or
+                                   redirects it, while still giving it the injected facts and
+                                   recording its cost apart; "learn" treats it as any other.
 
 The names before the mechanisms were renamed are read too, so an existing config file keeps
 working: `inject` (microskills), `untool` (toolprune), `spiral` (loopguard), with their
@@ -91,6 +97,7 @@ MICROSKILLS = ("off", "envfacts", "envfacts+distiller", "distiller")
 TOOLPRUNE = ("off", "propose", "auto")
 LOOPGUARD = ("off", "nudge", "stop")
 REPOMAP = ("off", "on", "start")
+SCRIPTED = ("skip", "learn")
 MODES = ("auto", "interactive", "headless")
 AGGR = ("conservative", "default", "aggressive")
 
@@ -201,11 +208,13 @@ class LiveConfig:
     history_max_sessions: int = 200
     history_days: int = 365
     history_dirs: list = field(default_factory=list)
+    scripted_sessions: str = "skip"
     shadow: bool = False
     vocabulary: str = "auto"
     warnings: list = field(default_factory=list)
 
     _CHOICES = {"mode": MODES, "microskills": MICROSKILLS, "toolprune": TOOLPRUNE,
+                "scripted_sessions": SCRIPTED,
                 "loopguard": LOOPGUARD, "repomap": REPOMAP, "loopguard_aggr": AGGR,
                 "vocabulary": ("auto", "generic", "python-git", "node-web"),
                 # Each CLI's own words (Claude Code 2.1.319, Codex 0.167.0); whether a model
@@ -329,7 +338,8 @@ _ENV = {"TE_MODE": "mode", "TE_SHADOW": "shadow",
         "TE_PI_EXTENSIONS": "pi_extensions", "TE_PI_CLI": "pi_cli",
         "TE_HERMES_CLI": "hermes_cli",
         "TE_HISTORY_IMPORT": "history_import", "TE_HISTORY_MAX_SESSIONS": "history_max_sessions",
-        "TE_HISTORY_DAYS": "history_days", "TE_HISTORY_DIRS": "history_dirs"}
+        "TE_HISTORY_DAYS": "history_days", "TE_HISTORY_DIRS": "history_dirs",
+        "TE_SCRIPTED_SESSIONS": "scripted_sessions"}
 _ENV_THRESHOLDS = ("TE_SPIRAL_THRESHOLDS", "TE_LOOPGUARD_THRESHOLDS")
 
 

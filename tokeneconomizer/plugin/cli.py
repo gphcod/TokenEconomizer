@@ -260,7 +260,10 @@ def cmd_status(args):
         print(f"  note         {out['session_note']}")
     def earlier(n):
         return f" (+{n} from earlier history)" if n else ""
-    print(f"  sessions     {ledger['sessions']} folded{earlier(ledger['imported_sessions'])}, "
+    scripted = (f" (+{ledger['scripted_sessions']} scripted, not learned from)"
+                if ledger.get("scripted_sessions") else "")
+    print(f"  sessions     {ledger['sessions']} folded{earlier(ledger['imported_sessions'])}"
+          f"{scripted}, "
           f"{accounting.fmt_tokens(ledger['effective_tokens'])} effective tokens, plugin "
           f"overhead {accounting.fmt_tokens(ledger['overhead_tokens'])} "
           f"({ledger['overhead_frac']:.1%})")
@@ -456,12 +459,14 @@ def cmd_toolprune(args):
                       f"{', '.join(denylist.CODEX_LIVE_CAPABILITIES)})")
                 return 2
         try:
-            added = denylist.apply(ctx.repo.root, tools, ctx.store, host=host)
-        except RuntimeError as e:
+            # Named by the person: no longer one they gave back, whatever `restore` said
+            # before. Both steps change the deny list's record, under one lock.
+            with denylist.one_writer(ctx.store):
+                added = denylist.apply(ctx.repo.root, tools, ctx.store, host=host)
+                denylist.set_kept(ctx.store, ctx.repo.root, host, remove=tools)
+        except (RuntimeError, OSError) as e:
             print(f"not applied: {e}")
             return 1
-        # Named by the person: no longer one they gave back, whatever `restore` said before.
-        denylist.set_kept(ctx.store, ctx.repo.root, host, remove=tools)
         print(f"added: {', '.join(added) or '(already present)'}\n"
               f"in {denylist.settings_path(ctx.repo.root, host)} -- takes effect from the next "
               f"session.")
@@ -489,13 +494,15 @@ def cmd_toolprune(args):
         return 0
     if action == "restore":
         try:
-            removed = denylist.restore(ctx.repo.root, ctx.store, args.tools or None, host=host)
-        except RuntimeError as e:
+            # Given back by the person: `toolprune: auto` must not take them away again at the
+            # next fold, and a proposal does not ask for them again. One lock over both steps.
+            with denylist.one_writer(ctx.store):
+                removed = denylist.restore(ctx.repo.root, ctx.store, args.tools or None,
+                                           host=host)
+                denylist.set_kept(ctx.store, ctx.repo.root, host, add=removed)
+        except (RuntimeError, OSError) as e:
             print(f"not restored: {e}")
             return 1
-        # Given back by the person: `toolprune: auto` must not take them away again at the next
-        # fold, and a proposal does not ask for them again.
-        denylist.set_kept(ctx.store, ctx.repo.root, host, add=removed)
         print(f"removed: {', '.join(removed) or '-'} (from the next session)"
               + (f"; kept from now on (`toolprune apply {removed[0]}` removes one again)"
                  if removed else ""))

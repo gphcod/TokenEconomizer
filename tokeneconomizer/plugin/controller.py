@@ -77,6 +77,22 @@ class LiveController:
             return f"$tokeneconomizer:{name}"    # the plugin's Codex skills
         return f"te --host {self.host.name} {name}"
 
+    def _scripted(self, s, recheck=False):
+        """Is this a session nobody watches (`codex exec`, `claude -p`), which under
+        `scripted_sessions=skip` is never judged or redirected and not learned from? The answer
+        is recorded in the session once it can be told, because Claude Code's sign is the hook
+        process's environment, which a later fold does not have; `mode` decides when set.
+        `recheck` (every SessionStart): a conversation resumed by a script becomes scripted from
+        then on; one never stops being scripted."""
+        if "scripted" not in s or (recheck and not s.get("scripted")):
+            known = self.host.scripted(self.ctx.env,
+                                       self.host.transcript(self.p) or s.get("transcript"))
+            if known is not None:
+                s["scripted"] = bool(known) or bool(s.get("scripted"))
+        if self.cfg.scripted_sessions != "skip" or self.cfg.mode == "interactive":
+            return False
+        return self.cfg.mode == "headless" or bool(s.get("scripted"))
+
     def _log(self, kind, **fields):
         self.store.append("events.jsonl", dict(
             fields, kind=kind, at=time.time(), session_id=self.sid, shadow=self.cfg.shadow))
@@ -184,6 +200,7 @@ class LiveController:
 
         if seen != seen_before:
             self.store.write("notices.json", seen)
+        self._scripted(s, recheck=True)         # recorded while the hook's environment is here
         self._save(s)
         repos.note_repo(self.ctx.root, self.ctx.repo)
         repos.prune_pins(self.ctx.root, self.host.name)
@@ -277,7 +294,9 @@ class LiveController:
         if g.held:                  # reached on a queued call; the turn ended before the next one
             self._log("undelivered", action=g.held[0], reason=g.held[1])
         summary = g.summary(stopped_normally)
-        if g.cum_turns and stopped_normally:
+        # A scripted session's turns (one long autonomous prompt) are not this repository's
+        # usual turns, and would stretch the envelope the guard measures turns against.
+        if g.cum_turns and stopped_normally and not self._scripted(s):
             loopguard.record_turn(self.store, g, level=self.cfg.loopguard_aggr,
                               overrides=self.cfg.loopguard_thresholds)
         s["turns"] = (s.get("turns") or [])[-(TURN_HISTORY - 1):] + [summary]
@@ -362,9 +381,19 @@ class LiveController:
         # agents ran under a turn cap, hence their envelope gate).
         thr = dict(thr, gate_over_envelope=False,
                    gate_min_turns=max(thr["gate_min_turns"], thr["min_turns"]))
-        decision = g.fold(name, args, text, code, envelope=envelope, thr=thr,
-                          judge=self._judge(thr, envelope),
-                          nudge_budget=self.cfg.loopguard_nudges)
+        quiet = self._scripted(s)
+        if quiet:
+            # Folded call by call, but with no envelope, no judge and no backstop it can neither
+            # pay for a verdict nor redirect: nobody watches a scripted run, and its failures
+            # (a sandbox, no network) are not this repository's loops.
+            decision = g.fold(name, args, text, code, envelope=None,
+                              thr=dict(thr, backstop_turns=None), judge=None,
+                              nudge_budget=self.cfg.loopguard_nudges)
+            decision = None
+        else:
+            decision = g.fold(name, args, text, code, envelope=envelope, thr=thr,
+                              judge=self._judge(thr, envelope),
+                              nudge_budget=self.cfg.loopguard_nudges)
         # A queued call's hook has already answered, so a decision reached on it waits, untouched
         # and uncounted, for the turn's next call: acting on it here would spend the turn's redirect
         # on an answer no one reads.

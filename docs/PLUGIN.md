@@ -437,7 +437,13 @@ thresholds), in its terminal UI and headless.
   call without Ctrl+O.
 * Telling headless from interactive: Claude Code's environment says so, and Pi's extension; Codex
   only in its rollout's first record (`source: "exec"`); Copilot only in its own command line
-  (`copilot -p`), its payloads, environment and session log being the same in both modes.
+  (`copilot -p`), its payloads, environment and session log being the same in both modes. Under
+  `scripted_sessions=skip` (the default) such a session is recorded for its cost and nothing
+  else: its hooks note it once, its loop guard runs with no envelope, judge or backstop (so it
+  neither pays for a verdict nor redirects), its turns do not feed the envelope, and its fold
+  runs no micro-skills or tool pruning. A script's runs (council reviews through `codex exec`)
+  are long autonomous turns, often sandboxed, whose failures say little about a person's
+  sessions; on the first day of one install every Codex session learned from was one.
 * Codex 0.163.0 edits with `apply_patch <<'PATCH'` and runs the tests in the same command; the
   guard counts those edits (`loopguard.shell_edits`).
 

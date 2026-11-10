@@ -157,7 +157,7 @@ def _fold_toolprune(ctx, adapter, run_dir, session_id, transcript=None, workdir=
         try:
             restored = denylist.restore(ctx.repo.root, ctx.store,
                                       [t for t in applied if t in protected], host=host)
-        except RuntimeError:            # an unreadable or redirected settings file: leave it
+        except (RuntimeError, OSError):  # an unreadable or redirected settings file: leave it
             restored = []
     if restored:
         applied = denylist.applied_for(ctx.store, ctx.repo.root, ctx.host.name)
@@ -449,7 +449,7 @@ def apply_pending(ctx, now=None):
                 unt["auto_applied"] = denylist.apply(root, items, ctx.store, host=ctx.host.name)
                 unt["proposal"] = [t for t in unt.get("proposal") or [] if t not in items]
                 unt.pop("auto_apply_refused", None)
-            except RuntimeError as e:      # an unreadable, committed or redirected file
+            except (RuntimeError, OSError) as e:   # an unreadable, committed or redirected file
                 unt["auto_apply_refused"] = str(e)
         unt.pop("auto_pending", None)
         ctx.store.write("untool.json", unt)
@@ -481,6 +481,18 @@ def import_blocks(ctx):
     """Is an import of earlier sessions under way here, so that a live fold must wait?"""
     doc = ctx.store.read(HISTORY)
     return isinstance(doc, dict) and doc.get("state") in HISTORY_BLOCKING
+
+
+def scripted_session(ctx, sess, transcript):
+    """Is a finished session one nobody watched, which `scripted_sessions=skip` keeps out of
+    learning? `mode` decides when set; else what its hooks recorded (`controller._scripted`:
+    Claude Code's sign is their environment), or what its own log says (Codex)."""
+    cfg = ctx.config
+    if cfg.scripted_sessions != "skip" or cfg.mode == "interactive":
+        return False
+    if cfg.mode == "headless" or sess.get("scripted"):
+        return True
+    return bool(transcript) and bool(ctx.host.log_headless(transcript))
 
 
 def fold_session(ctx, session_id, transcript_path=None):
@@ -523,6 +535,11 @@ def fold_locked(ctx, session_id, transcript_path=None, imported=False, span=None
               "started": started, "ended": ended, "shadow": ctx.config.shadow}
     if imported:
         record["imported"] = True
+    # A session nobody watched (`scripted_sessions=skip`) is recorded for its cost and nothing
+    # else: no micro-skills, no tool pruning evidence (its turns never fed the envelope either).
+    scripted = not imported and scripted_session(ctx, sess, transcript)
+    if scripted:
+        record["scripted"] = True
     workdir = tempfile.mkdtemp(prefix="te-fold-")
     try:
         trace_path = ctx.host.mechanism_trace(transcript, workdir) if transcript else None
@@ -533,6 +550,15 @@ def fold_locked(ctx, session_id, transcript_path=None, imported=False, span=None
         record["prompts"] = prompts
         if not trace_path:
             record["error"] = "transcript unreadable"
+        elif scripted:
+            record["injection"] = record["untool"] = None
+            ctx.host.settle(transcript)
+            usage = ctx.host.session_usage(transcript)
+            eff, priced_by = accounting.effective(usage)
+            record.update({k: usage.get(k) for k in (
+                "model", "requests", "input_tokens", "cache_read_input_tokens",
+                "cache_creation_input_tokens", "output_tokens")})
+            record["effective_tokens"], record["priced_by"] = eff, priced_by
         else:
             run_dir = _run_dir(workdir, trace_path)
             # An earlier session is scored against the tools its own log shows (used, listed),
@@ -576,6 +602,8 @@ def fold_locked(ctx, session_id, transcript_path=None, imported=False, span=None
         entry = {"at": time.time(), "transcript": transcript}
         if imported:
             entry["imported"] = True
+        if scripted:
+            entry["scripted"] = True
         folded[session_id] = entry
         ctx.store.write("folded.json", folded)
         if sess:

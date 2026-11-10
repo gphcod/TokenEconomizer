@@ -178,6 +178,16 @@ class Host:
     def headless(self, env, transcript=None):
         return False
 
+    def scripted(self, env, transcript=None):
+        """Whether this session runs with nobody watching (`headless`), asked once per session
+        by its hooks (`controller._scripted`); None where it cannot be told yet."""
+        return self.headless(env, transcript)
+
+    def log_headless(self, transcript):
+        """Whether a finished session's own log says nobody watched it: for a fold, which has
+        neither the hooks' environment nor their process (only Codex's log says)."""
+        return False
+
     def tool_call(self, p):
         """(tool_name, args, result_text, exit_code_or_None) for a PostToolUse payload, or for
         a PostToolUseFailure one: Claude Code reports a call that failed -- a non-zero exit, a
@@ -377,6 +387,14 @@ class Codex(Host):
         # The rollout's first record names its front end: `source: "exec"`, originator
         # `codex_exec` under `codex exec`; `codex-tui` in the terminal UI (0.163.0). The hook's
         # payload and environment are the same in both.
+        return bool(trace.codex_rollout_head(transcript or "")["headless"])
+
+    def scripted(self, env, transcript=None):
+        # Not known before the rollout's `session_meta` is written.
+        head = trace.codex_rollout_head(transcript or "")
+        return bool(head["headless"]) if head["session_id"] else None
+
+    def log_headless(self, transcript):
         return bool(trace.codex_rollout_head(transcript or "")["headless"])
 
     def mechanism_trace(self, transcript_path, workdir):
