@@ -419,7 +419,10 @@ def _proposal(ctx, unt):
     repository share its evidence, and one of them may have applied the list before another."""
     mine = set(denylist.applied_for(ctx.store, ctx.repo.root, ctx.host.name))
     mine |= set(denylist.kept_for(ctx.store, ctx.repo.root, ctx.host.name))
-    return [t for t in unt.get("proposal", []) if t not in mine]
+    from .adapter import LiveAdapter
+    protected = LiveAdapter(ctx.host, ctx.repo.root,
+                            protect=ctx.config.toolprune_protect).protected_tools()
+    return [t for t in unt.get("proposal", []) if t not in mine and t not in protected]
 
 
 def cmd_toolprune(args):
@@ -436,6 +439,13 @@ def cmd_toolprune(args):
         return 1
     if action == "apply":
         tools = args.tools or _proposal(ctx, unt)
+        from .adapter import LiveAdapter
+        protected = LiveAdapter(ctx.host, ctx.repo.root,
+                                protect=ctx.config.toolprune_protect).protected_tools()
+        skipped = [t for t in tools if t in protected]
+        if skipped:
+            print("protected; not pruned: " + ", ".join(skipped))
+        tools = [t for t in tools if t not in protected]
         if not tools:
             print("nothing to apply")
             return 0

@@ -1585,3 +1585,91 @@ def test_measure_reports_a_failed_probe_in_one_line(env, repo, monkeypatch, caps
     monkeypatch.setattr(toolcheck, "measure", fail)
     assert cli.main(["--host", "claude", "--cwd", repo, "toolprune", "measure", "Workflow"]) == 1
     assert capsys.readouterr().out.strip() == "not measured: `claude -p` exited 1: boom"
+
+
+def test_codex_protection_keeps_images_without_protecting_optional_capabilities(env, repo, tmp_path):
+    env = dict(env, TE_TOOLPRUNE="propose", TE_TOOLPRUNE_PROTECT="image_media")
+    for i in range(15):
+        run_session(env, repo, f"protected-{i}",
+                    codex_rollout(str(tmp_path / f"protected-{i}.jsonl"), repo, i, prompts=2),
+                    host="codex")
+    unt = store_for(env, repo, "codex").read("untool.json")
+    assert unt["proposal"] == ["collaboration", "goals"]
+    assert unt["capabilities"]["image_media"]["loaded_prompts"] == 30
+
+
+def test_codex_pending_list_rechecks_new_protection(env, repo, codex_accepts):
+    env = dict(env, TE_TOOLPRUNE="auto", TE_TOOLPRUNE_PROTECT="image_media")
+    ctx = LiveContext.build(hosts.detect({}, env, hint="codex"), repo, env)
+    ctx.store.write("untool.json", {"proposal":["image_media", "goals"],
+                    "auto_pending":{"items":["image_media", "goals"], "root":repo,
+                                    "since":time.time()-10000}})
+    assert fold.apply_pending(ctx) is None
+    assert denylist.applied_for(ctx.store, repo, "codex") == ["goals"]
+    assert "image_media" not in ctx.store.read("untool.json")["proposal"]
+
+
+def test_codex_protected_existing_rule_is_restored_without_restoring_goals(env, repo, tmp_path,
+                                                                         codex_accepts):
+    ctx = LiveContext.build(hosts.detect({}, env, hint="codex"), repo, env)
+    denylist.apply(repo, ["image_media", "goals"], ctx.store, host="codex")
+    protected_env = dict(env, TE_TOOLPRUNE_PROTECT="image_media")
+    run_session(protected_env, repo, "restore-image",
+                codex_rollout(str(tmp_path / "restore-image.jsonl"), repo, 1), host="codex")
+    assert denylist.applied_for(ctx.store, repo, "codex") == ["goals"]
+    assert "view_image = false" not in open(denylist.settings_path(repo, "codex"), encoding="utf-8").read()
+
+def test_codex_restores_by_itself_only_what_it_may_edit(tmp_path, env, codex_accepts):
+    """A capability protected since its rule was written comes back at the next fold -- but not
+    by editing a config that is now committed: that file and the rule's record stay as they
+    are, and only `toolprune restore`, asked for, edits it."""
+    import subprocess
+    r = tmp_path / "shared"
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q", str(r)], check=True)
+    ctx = LiveContext.build(hosts.detect({}, env, hint="codex"), str(r), env)
+    assert denylist.apply(str(r), ["image_media", "goals"], ctx.store, host="codex")
+    path = denylist.settings_path(str(r), "codex")
+    subprocess.run(git + ["-C", str(r), "add", "-f", ".codex/config.toml"], check=True)
+    subprocess.run(git + ["-C", str(r), "commit", "-qm", "team config"], check=True)
+    before = open(path, encoding="utf-8").read()
+    protected_env = dict(env, TE_TOOLPRUNE_PROTECT="image_media")
+    run_session(protected_env, str(r), "committed",
+                codex_rollout(str(tmp_path / "committed.jsonl"), str(r), 1), host="codex")
+    assert open(path, encoding="utf-8").read() == before
+    assert sorted(denylist.applied_for(ctx.store, str(r), "codex")) == ["goals", "image_media"]
+    assert any(rec["session_id"] == "committed" and "error" not in rec
+               for rec in ctx.store.read_lines("ledger.jsonl"))
+    assert denylist.restore(str(r), ctx.store, ["image_media"], host="codex") == ["image_media"]
+
+
+def test_an_unreadable_codex_config_does_not_stop_the_fold(env, repo, tmp_path, codex_accepts,
+                                                           monkeypatch):
+    import builtins
+    ctx = LiveContext.build(hosts.detect({}, env, hint="codex"), repo, env)
+    denylist.apply(repo, ["image_media", "goals"], ctx.store, host="codex")
+    target = os.path.normcase(os.path.abspath(denylist.settings_path(repo, "codex")))
+
+    def locked(path, *a, **k):
+        if os.path.normcase(os.path.abspath(str(path))) == target:
+            raise PermissionError(13, "locked by another process", str(path))
+        return builtins.open(path, *a, **k)
+    monkeypatch.setattr(denylist, "open", locked, raising=False)
+    run_session(dict(env, TE_TOOLPRUNE_PROTECT="image_media"), repo, "locked",
+                codex_rollout(str(tmp_path / "locked.jsonl"), repo, 1), host="codex")
+    assert sorted(denylist.applied_for(ctx.store, repo, "codex")) == ["goals", "image_media"]
+    assert any(rec["session_id"] == "locked" and "error" not in rec
+               for rec in ctx.store.read_lines("ledger.jsonl"))
+
+
+def test_toolprune_apply_leaves_protected_names_out(env, repo, codex_accepts, monkeypatch,
+                                                    capsys):
+    from tokeneconomizer.plugin import cli
+    for k, v in dict(env, TE_TOOLPRUNE_PROTECT="image_media").items():
+        monkeypatch.setenv(k, v)
+    assert cli.main(["--host", "codex", "--cwd", repo, "toolprune", "apply", "image_media",
+                     "goals"]) == 0
+    assert "protected; not pruned: image_media" in capsys.readouterr().out
+    st = LiveContext.build(hosts.detect({}, env, hint="codex"), repo, env).store
+    assert denylist.applied_for(st, repo, "codex") == ["goals"]
+

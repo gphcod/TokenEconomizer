@@ -1122,6 +1122,21 @@ def test_auto_holds_what_the_live_sessions_alone_would_have_held(env, repo, code
     assert not os.path.exists(denylist.settings_path(repo, "codex"))
 
 
+def test_an_imported_codex_session_gives_back_no_rule_and_a_live_one_does(env, repo, codex_home,
+                                                                         tmp_path, monkeypatch):
+    monkeypatch.setattr(denylist, "codex_config_error", lambda root, **kw: None)
+    env = dict(env, TE_TOOLPRUNE_PROTECT="image_media")
+    ctx = cx_ctx(env, repo)
+    assert sorted(denylist.apply(repo, ["image_media", "goals"], ctx.store, host="codex")) == [
+        "goals", "image_media"]
+    rollout(codex_home, repo, cx(0), cx_trap(0))
+    ctx.store.write("history.json", {"state": "running", "heartbeat": time.time()})
+    assert history.run(ctx, auto=True)["imported"] == 1
+    assert sorted(denylist.applied_for(ctx.store, repo, "codex")) == ["goals", "image_media"]
+    cx_folded_live(env, repo, tmp_path, 1)
+    assert denylist.applied_for(ctx.store, repo, "codex") == ["goals"]
+
+
 def test_where_codex_keeps_its_rollouts(tmp_path):
     home = tmp_path / "codex"
     day = home / "sessions" / "2026" / "11" / "02"

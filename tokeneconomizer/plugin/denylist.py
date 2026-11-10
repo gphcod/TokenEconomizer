@@ -453,13 +453,18 @@ def _apply_codex(repo_root, capabilities, store):
     return added
 
 
-def _restore_codex(repo_root, store, capabilities):
+def _restore_codex(repo_root, store, capabilities, refuse_tracked=False):
     mine = set(applied(store, settings_path(repo_root, "codex")))
     target = mine if not capabilities else mine & set(capabilities)
     if not target:
         return []
     path = settings_path(repo_root, "codex")
     _guard_target(repo_root, path)
+    if refuse_tracked and os.path.exists(path) and _git_tracked(repo_root, CODEX_CONFIG_REL):
+        # As `_apply_codex` will not edit a committed file by itself, neither will a restore the
+        # person did not ask for; `te toolprune restore` still does what it is told.
+        raise RuntimeError(f"{path} is committed in this repository; the plugin will not edit "
+                           "a shared file by itself.")
     if os.path.exists(path):
         text = _toml_remove(open(path, encoding="utf-8").read(),
                             [f"{MARK}:{c}" for c in target])
@@ -532,10 +537,12 @@ def apply(repo_root, tools, store, host="claude"):
     return _apply_json_list(repo_root, tools, store, host)
 
 
-def restore(repo_root, store, tools=None, host="claude"):
-    """Remove entries this plugin added (all of them, or just `tools`). Returns removed."""
+def restore(repo_root, store, tools=None, host="claude", refuse_tracked=False):
+    """Remove entries this plugin added (all of them, or just `tools`). Returns removed.
+    `refuse_tracked`: a restore the plugin does by itself raises RuntimeError rather than edit a
+    Codex config that is committed (the other agents' files are per-user)."""
     if host == "codex":
-        return _restore_codex(repo_root, store, tools)
+        return _restore_codex(repo_root, store, tools, refuse_tracked=refuse_tracked)
     return _restore_json_list(repo_root, store, tools, host)
 
 

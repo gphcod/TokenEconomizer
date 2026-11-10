@@ -292,6 +292,21 @@ def _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts
     stage._warned_no_catalog = True
     stage.build_tools({"instance_id": session_id}, 0)
     applied = denylist.applied_for(ctx.store, ctx.repo.root, ctx.host.name)
+    # A capability that has since become protected comes back: the plugin's OWN rule for it is
+    # removed, as `_fold_toolprune` does on the other agents. Not for a session from history,
+    # which gives nothing back; and a config the plugin cannot read, or one that is now
+    # committed, is left as it is, with its rule still recorded.
+    protected = adapter.protected_tools()
+    restored = []
+    protected_applied = [c for c in applied if c in protected]
+    if protected_applied and not imported and not ctx.config.shadow:
+        try:
+            restored = denylist.restore(ctx.repo.root, ctx.store, protected_applied,
+                                        host="codex", refuse_tracked=True)
+        except (RuntimeError, OSError):
+            restored = []
+        if restored:
+            applied = denylist.applied_for(ctx.store, ctx.repo.root, ctx.host.name)
     kept = set(denylist.kept_for(ctx.store, ctx.repo.root, ctx.host.name))   # given back
     # The mask this session actually ran under: none, for one from before the plugin.
     stage.codex_profile._pending["logical_capabilities"] = [] if imported else sorted(applied)
@@ -330,7 +345,7 @@ def _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts
         live_pruned = set(live.codex_profile.state.get("current_pruned") or ())
     proposal = [c for c in denylist.CODEX_LIVE_CAPABILITIES
                 if c in (state.get("current_pruned") or ()) and c not in ever_used
-                and c not in applied and c not in kept
+                and c not in applied and c not in kept and c not in protected
                 and enough_evidence(int(loaded.get(c, 0)), int(loaded_prompts.get(c, 0)),
                                     ctx.config, high_risk=c in CODEX_HIGH_RISK)]
     doc = {"sessions": int(state.get("tasks_completed") or 0), "catalog_source": "capabilities",
@@ -372,7 +387,7 @@ def _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts
             _hold(doc, prior, held, ctx.repo.root)
     ctx.store.write("untool.json", doc)
     return {"proposal": doc["proposal"], "pending": bool(doc.get("auto_pending")),
-            "restored": []}
+            "restored": restored}
 
 
 def _hold(doc, prior, proposal, root):
@@ -421,7 +436,9 @@ def apply_pending(ctx, now=None):
         root = pend.get("root") or ctx.repo.root
         done = set(denylist.applied_for(ctx.store, root, ctx.host.name))
         done |= set(denylist.kept_for(ctx.store, root, ctx.host.name))
-        items = [t for t in pend.get("items") or [] if t not in done]
+        protected = LiveAdapter(ctx.host, root, protect=ctx.config.toolprune_protect).protected_tools()
+        items = [t for t in pend.get("items") or [] if t not in done and t not in protected]
+        unt["proposal"] = [t for t in unt.get("proposal") or [] if t not in protected]
         if items and ctx.config.toolprune == "auto" and not ctx.config.shadow:
             idle = now - last_activity(ctx)
             quiet_s = ctx.config.toolprune_quiet_minutes * 60
