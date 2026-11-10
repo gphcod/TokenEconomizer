@@ -1,7 +1,9 @@
-"""Importing a repository's sessions from before the plugin, from Claude Code's own logs.
+"""Importing a repository's sessions from before the plugin, from the agent's own logs.
 
 Logs are laid out as Claude Code keeps them: `<config>/projects/<folder>/<session id>.jsonl`,
-each entry naming the session, its directory and the time. The cases that are about time order
+each entry naming the session, its directory and the time; and as Codex keeps its rollouts:
+`<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl[.zst]` and
+`archived_sessions/`. The cases that are about time order
 call the import and the fold directly, and stand in for the detached processes, rather than
 running everything inline (`TE_FOLD_SYNC=1`), which would hide the races they are about.
 """
@@ -34,12 +36,19 @@ def claude_home(tmp_path):
 
 
 @pytest.fixture
-def env(tmp_path, claude_home):
+def codex_home(tmp_path):
+    d = tmp_path / "codex"
+    (d / "sessions").mkdir(parents=True)
+    return d
+
+
+@pytest.fixture
+def env(tmp_path, claude_home, codex_home):
     """A person who turned the import on (`history_import` is off by default)."""
     return {"TOKENECONOMIZER_HOME": str(tmp_path / "home"), "TE_FOLD_SYNC": "1",
             "TE_HISTORY_IMPORT": "on",
             "TE_TOOLPRUNE_QUIET_MINUTES": "0", "TE_MICROSKILLS": "envfacts",
-            "CLAUDE_CONFIG_DIR": str(claude_home),
+            "CLAUDE_CONFIG_DIR": str(claude_home), "CODEX_HOME": str(codex_home),
             "GIT_CEILING_DIRECTORIES": str(tmp_path), "PATH": os.environ.get("PATH", "")}
 
 
@@ -788,7 +797,7 @@ def test_where_claude_code_keeps_its_logs(tmp_path):
     logs = hosts.ClaudeCode().history({"CLAUDE_CONFIG_DIR": str(tmp_path / "none")},
                                       [str(tmp_path)])
     assert [(x["session_id"], x["folder"]) for x in logs] == [("s1", "-w")]
-    assert hosts.Codex().history({}) == []
+    assert hosts.Codex().history({"CODEX_HOME": str(tmp_path / "none")}) == []
 
 
 def test_te_history_dry_run_writes_nothing(env, repo, claude_home, monkeypatch, capsys):
@@ -805,7 +814,9 @@ def test_te_history_dry_run_writes_nothing(env, repo, claude_home, monkeypatch, 
     assert cli.main(["--cwd", repo, "--host", "claude", "history", "import"]) == 1
 
 
-def test_no_hook_reads_history_on_another_agent(env, repo, claude_home, tmp_path):
+def test_no_hook_reads_another_agents_history(env, repo, claude_home, tmp_path):
+    """Codex's import reads Codex's rollouts, never Claude Code's logs; an agent that keeps no
+    history the plugin reads (Copilot) imports nothing."""
     history_log(claude_home, repo, "old0", trap(repo, 0))
     t = str(tmp_path / "rollout-x.jsonl")
     open(t, "w").close()
@@ -813,4 +824,339 @@ def test_no_hook_reads_history_on_another_agent(env, repo, claude_home, tmp_path
     hook.main(["--host", "codex"], io.StringIO(json.dumps({
         "hook_event_name": "SessionStart", "session_id": "c1", "source": "startup",
         "transcript_path": t, "cwd": repo})), out, env)
-    assert store_for(env, repo, host="codex").read("history.json") is None
+    st = store_for(env, repo, host="codex")
+    assert st.read("history.json")["imported"] == 0 and not st.read("folded.json")
+    hook.main(["--host", "copilot"], io.StringIO(json.dumps({
+        "hook_event_name": "SessionStart", "session_id": "p1", "source": "startup",
+        "cwd": repo})), io.StringIO(), env)
+    assert store_for(env, repo, host="copilot").read("history.json") is None
+
+
+# ---- Codex ----------------------------------------------------------------------------------
+try:
+    from compression import zstd as _zstd
+except ImportError:                     # Python < 3.14
+    _zstd = None
+needs_zstd = pytest.mark.skipif(_zstd is None, reason="this Python has no compression.zstd")
+
+
+def cx(n):
+    """A thread id, as Codex names one."""
+    return f"01a1c000-0000-7000-8000-{n:012d}"
+
+
+def cx_trap(i):
+    """A Codex session's prompt that meets the missing `pytest` and works around it."""
+    return [(f"fix bug {i}", [
+        ("patch", [f"pkg/mod{i}.py"]),
+        ("cmd", "pytest -q tests/test_a.py", "bash: pytest: command not found", 127),
+        ("cmd", "python -m pytest -q tests/test_a.py", "1 passed in 0.1s", 0)])]
+
+
+def cx_looked():
+    return [("look", [("cmd", "ls", "a.py", 0), ("cmd", "cat a.py", "x", 0)])]
+
+
+def rollout(codex_home, cwd, sid, prompts, age_s=3600, source="cli", originator="codex-tui",
+            archived=False, compressed=False, aborted=(), cut=False, meta_id=None):
+    """A finished Codex session's rollout where Codex keeps it, last written `age_s` ago: per
+    prompt one turn of commands (`bash -lc SCRIPT`) and file changes, ended by `task_complete`,
+    or by `turn_aborted` for the indices in `aborted`; with `cut`, the last turn has no end."""
+    end = time.time() - age_s
+    start = end - 300
+    stamp = time.strftime("%Y-%m-%dT%H-%M-%S", time.localtime(start))
+    d = (os.path.join(str(codex_home), "archived_sessions") if archived else
+         os.path.join(str(codex_home), "sessions", *stamp[:10].split("-")))
+    os.makedirs(d, exist_ok=True)
+    recs = [{"timestamp": _iso(start), "type": "session_meta", "payload": {
+        "id": meta_id or sid, "timestamp": _iso(start), "cwd": cwd, "originator": originator,
+        "cli_version": "0.166.0", "source": source}}]
+    n = 0
+    for k, (text, calls) in enumerate(prompts):
+        turn = f"turn-{k}"
+
+        def ev(payload):
+            recs.append({"type": "event_msg", "payload": dict(payload, turn_id=turn)})
+        recs.append({"type": "turn_context", "payload": {"turn_id": turn, "cwd": cwd,
+                                                         "model": "gpt-6.1-sol"}})
+        ev({"type": "task_started"})
+        ev({"type": "item_completed", "item": {"type": "UserMessage", "id": f"u{k}",
+                                               "content": [{"type": "text", "text": text}]}})
+        for c in calls:
+            n += 1
+            if c[0] == "cmd":
+                item = {"type": "CommandExecution", "id": f"c{n}",
+                        "command": ["bash", "-lc", c[1]], "cwd": cwd,
+                        "aggregated_output": c[2], "exit_code": c[3],
+                        "status": "completed" if c[3] == 0 else "failed"}
+            else:
+                item = {"type": "FileChange", "id": f"f{n}", "status": "completed",
+                        "changes": {os.path.join(cwd, p): {"type": "update"} for p in c[1]}}
+            ev({"type": "item_completed", "item": item})
+        if k in aborted:
+            ev({"type": "turn_aborted", "reason": "interrupted"})
+        elif not (cut and k == len(prompts) - 1):
+            ev({"type": "item_completed", "item": {"type": "AgentMessage", "id": f"a{k}",
+                                                   "content": [{"type": "Text",
+                                                                "text": "Done."}]}})
+            ev({"type": "task_complete", "last_agent_message": "Done."})
+        ev({"type": "token_count", "info": {"total_token_usage": {
+            "input_tokens": 3000 * (k + 1), "cached_input_tokens": 2000 * (k + 1),
+            "output_tokens": 90, "reasoning_output_tokens": 10}}})
+    data = ("\n".join(json.dumps(r) for r in recs) + "\n").encode("utf-8")
+    path = os.path.join(d, f"rollout-{stamp}-{sid}.jsonl")
+    if compressed:
+        path += ".zst"
+        data = _zstd.compress(data) if _zstd else b"\x28\xb5\x2f\xfd" + data
+    with open(path, "wb") as fh:
+        fh.write(data)
+    os.utime(path, (end, end))
+    return path
+
+
+def cx_ctx(env, repo):
+    return LiveContext.build(hosts.Codex(), repo, env)
+
+
+def cx_start(env, repo, sid, tmp_path):
+    t = str(tmp_path / f"rollout-2026-01-01T00-00-00-{sid}.jsonl")
+    open(t, "w").close()
+    return call(env, {"hook_event_name": "SessionStart", "session_id": sid,
+                      "source": "startup", "transcript_path": t, "cwd": repo}, "codex")
+
+
+def cx_folded_live(env, repo, tmp_path, n, prompts=1):
+    """A Codex session of `prompts` prompts the plugin's own hooks saw end, folded."""
+    t = rollout(tmp_path / "elsewhere", repo, cx(900 + n), cx_trap(n) * prompts)
+    base = {"session_id": cx(900 + n), "transcript_path": t, "cwd": repo}
+    call(env, dict(base, hook_event_name="SessionStart", source="startup"), "codex")
+    call(env, dict(base, hook_event_name="SessionEnd", reason="other"), "codex")
+
+
+def test_codex_history_is_read_by_the_rollouts_directory_oldest_first(env, repo, codex_home,
+                                                                       tmp_path):
+    rollout(codex_home, repo, cx(0), cx_trap(0), age_s=3600 * 10)
+    rollout(codex_home, repo, cx(1), cx_trap(1), age_s=3600 * 9, archived=True)
+    rollout(codex_home, repo, cx(2), cx_trap(2), age_s=3600 * 8, compressed=_zstd is not None)
+    other = tmp_path / "other"
+    other.mkdir()
+    rollout(codex_home, str(other), cx(10), cx_trap(10))                    # another repository
+    rollout(codex_home, str(tmp_path / "gone"), cx(11), cx_trap(11))        # its directory gone
+    rollout(codex_home, repo, cx(12), cx_trap(12), age_s=5)                 # still writing
+    rollout(codex_home, repo, cx(13), cx_trap(13), source="exec", originator="codex_exec")
+    rollout(codex_home, repo, cx(14), cx_trap(14) * 2, source="exec", originator="Codex Desktop")
+    rollout(codex_home, repo, cx(15), cx_trap(15),
+            source={"subagent": {"thread_spawn": {"parent_thread_id": cx(0), "depth": 1}}})
+    rollout(codex_home, repo, cx(16), [])                                   # no prompt
+    rollout(codex_home, repo, cx(17), cx_trap(17), meta_id=cx(99))          # names another id
+
+    first = cx_start(env, repo, cx(50), tmp_path)
+    st = store_for(env, repo, "codex")
+    assert ledger_ids(st) == [cx(0), cx(1), cx(2)]
+    recs = st.read_lines("ledger.jsonl")
+    assert all(r["imported"] and r["host"] == "codex" and r["untool_applied"] == []
+               and r["prompts"] == 1 and "error" not in r for r in recs)
+    assert all(e["imported"] for e in st.read("folded.json").values())
+    doc = st.read("history.json")
+    assert doc["state"] == "done" and doc["imported"] == 3
+    assert doc["skipped"] == {"recent": 1, "headless": 2, "subagent": 1, "no_prompt": 1,
+                              "unsafe_id": 1}
+    assert "systemMessage" not in first
+    second = cx_start(env, repo, cx(51), tmp_path)
+    assert ("TokenEconomizer read 3 earlier session(s) of acme/widget from Codex's "
+            "history.") in second["systemMessage"]
+    assert not store_for(env, repo).read("folded.json")           # Claude Code's store: untouched
+
+
+def test_codex_import_seeds_the_envelope_from_turns_that_ended(env, repo, codex_home):
+    rollout(codex_home, repo, cx(0), cx_trap(0) + cx_looked(), age_s=7200)
+    one = [("one", [("cmd", "git status", "clean", 0)])]
+    rollout(codex_home, repo, cx(1), one + cx_trap(1), age_s=5400, aborted={0})
+    rollout(codex_home, repo, cx(2), cx_trap(2) + cx_looked(), age_s=3600, cut=True)
+    rollout(codex_home, repo, cx(3), [("fix", [
+        ("cmd", "grep -rn raise src", 'src/a.py:1: raise RuntimeError("x")', 0),
+        ("cmd", "python -m pytest -q", "FAILED tests/test_a.py::test_x - AssertionError", 1),
+        ("cmd", "python -m pytest -q", "1 passed in 0.1s", 0)])], age_s=1800)
+    ctx = cx_ctx(env, repo)
+    ctx.store.write("history.json", {"state": "running", "heartbeat": time.time()})
+    assert history.run(ctx, auto=True)["imported"] == 4
+    env_doc = ctx.store.read("envelope.json")
+    # cx0: both turns; cx1: its first turn was stopped; cx2: its last turn never ended.
+    assert env_doc["resolved_turns"] == [3, 2, 3, 3, 3]
+    # The exit codes Codex recorded decide: an error-looking output of a command that exited
+    # 0 is no failure, the test run that exited 1 is (without them, both would count).
+    assert [s["error_outputs"] for s in env_doc["resolved_snaps"]] == [0, 0, 0, 0, 1]
+    assert not os.path.exists(ctx.store.path("events.jsonl"))       # nothing was redirected
+
+
+def test_te_history_import_and_status_on_codex(env, repo, codex_home, monkeypatch, capsys):
+    for i in range(2):
+        rollout(codex_home, repo, cx(i), cx_trap(i), age_s=3600 * (10 - i))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert cli.main(["--cwd", repo, "--host", "codex", "history", "import", "--dry-run"]) == 0
+    assert "2 earlier session(s) of acme/widget would be read" in capsys.readouterr().out
+    assert store_for(env, repo, "codex").read("history.json") is None
+    assert cli.main(["--cwd", repo, "--host", "codex", "history", "import"]) == 0
+    assert "imported 2 earlier session(s) of acme/widget" in capsys.readouterr().out
+    cli.main(["--cwd", repo, "--host", "codex", "status"])
+    out = capsys.readouterr().out
+    assert "sessions     0 folded (+2 from earlier history)" in out
+    assert "read 2 earlier session(s) from Codex's history" in out
+    cli.main(["--cwd", repo, "--host", "codex", "status", "--json"])
+    js = json.loads(capsys.readouterr().out)
+    assert js["ledger"]["imported_sessions"] == 2 and js["history"]["imported"] == 2
+    assert js["toolprune"]["imported_sessions"] == 2 and js["toolprune"]["sessions"] == 0
+
+
+def test_a_codex_store_with_folded_sessions_is_not_imported_into(env, repo, codex_home,
+                                                                  tmp_path, monkeypatch, capsys):
+    cx_folded_live(dict(env, TE_HISTORY_IMPORT="off"), repo, tmp_path, 0)
+    rollout(codex_home, repo, cx(0), cx_trap(0))
+    st = store_for(env, repo, "codex")
+    assert list(st.read("folded.json")) == [cx(900)]
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert cli.main(["--cwd", repo, "--host", "codex", "history", "import"]) == 1
+    assert capsys.readouterr().out.startswith(
+        "not imported: acme/widget already has folded sessions")
+    cx_start(env, repo, cx(50), tmp_path)
+    doc = st.read("history.json")
+    assert doc["state"] == "skipped" and "already" in doc["reason"]
+    assert list(st.read("folded.json")) == [cx(900)]
+
+
+def test_a_planned_rollout_is_found_after_codex_archived_or_compressed_it(env, repo, codex_home,
+                                                                          monkeypatch):
+    paths = [rollout(codex_home, repo, cx(i), cx_trap(i), age_s=3600 * (10 - i))
+             for i in range(3)]
+    ctx = cx_ctx(env, repo)
+    clock = iter(range(1000))
+    monkeypatch.setattr(history, "_clock", lambda: next(clock))
+    ctx.store.write("history.json", {"state": "running", "heartbeat": time.time()})
+    assert history.run(ctx, auto=True, budget_s=1.5)["state"] == "partial"
+    # Meanwhile the person archives the second conversation, and Codex compresses the third.
+    os.makedirs(os.path.join(str(codex_home), "archived_sessions"))
+    os.replace(paths[1], os.path.join(str(codex_home), "archived_sessions",
+                                      os.path.basename(paths[1])))
+    if _zstd is not None:
+        with open(paths[2], "rb") as fh:
+            packed = _zstd.compress(fh.read())
+        with open(paths[2] + ".zst", "wb") as fh:
+            fh.write(packed)
+        os.remove(paths[2])
+    monkeypatch.setattr(history, "_clock", time.monotonic)
+    res = history.run(ctx, auto=True)
+    assert res["state"] == "done" and res["imported"] == 3 and res["skipped"] == {}
+    assert ledger_ids(ctx.store) == [cx(0), cx(1), cx(2)]
+
+
+@needs_zstd
+def test_a_compressed_rollout_is_measured_by_what_it_decompresses_to(env, repo, codex_home,
+                                                                     monkeypatch):
+    noisy = [("build", [("cmd", "make", "warning: x\n" * 20000, 0)])]
+    big = rollout(codex_home, repo, cx(0), noisy, compressed=True)
+    rollout(codex_home, repo, cx(1), cx_trap(1), compressed=True)
+    monkeypatch.setattr(history, "MAX_BYTES", 64 * 1024)
+    assert os.path.getsize(big) < history.MAX_BYTES                 # small on disk
+    p = history.plan(cx_ctx(env, repo))
+    assert [s["id"] for s in p["sessions"]] == [cx(1)] and p["skipped"] == {"too_large": 1}
+
+
+def test_a_compressed_rollout_is_left_out_where_python_cannot_read_it(env, repo, codex_home,
+                                                                      monkeypatch):
+    from tokeneconomizer.trace import jsonl
+    rollout(codex_home, repo, cx(0), cx_trap(0), compressed=True)
+    rollout(codex_home, repo, cx(1), cx_trap(1))
+    monkeypatch.setattr(jsonl, "_zstd", None)
+    p = history.plan(cx_ctx(env, repo))
+    assert [s["id"] for s in p["sessions"]] == [cx(1)] and p["skipped"] == {"compressed": 1}
+
+
+def test_an_imported_codex_session_holds_no_capability_under_auto(env, repo, codex_home,
+                                                                  tmp_path):
+    """Capabilities that went unused in Codex's history are proposed, but `auto` writes them
+    only once the plugin's own sessions are enough evidence alone."""
+    env = dict(env, TE_TOOLPRUNE="auto")
+    for i in range(5):
+        rollout(codex_home, repo, cx(i), cx_trap(i) + cx_looked(), age_s=3600 * (10 - i))
+    cx_start(env, repo, cx(50), tmp_path)
+    st = store_for(env, repo, "codex")
+    unt = st.read("untool.json")
+    assert st.read("history.json")["imported"] == 5
+    assert unt["proposal"] and sorted(unt["needs_apply"]) == sorted(unt["proposal"])
+    assert "auto_pending" not in unt and unt["imported_sessions"] == 5
+    cx_folded_live(env, repo, tmp_path, 1)               # one live session: not enough alone
+    unt = st.read("untool.json")
+    assert "auto_pending" not in unt and sorted(unt["needs_apply"]) == sorted(unt["proposal"])
+    assert not os.path.exists(denylist.settings_path(repo, "codex"))
+
+
+def test_auto_holds_what_the_live_sessions_alone_would_have_held(env, repo, codex_home,
+                                                                  tmp_path):
+    """The same live sessions, with and without imported history before them: after each fold,
+    `auto` holds the same capabilities. History must not hasten a demotion -- image tools need
+    three unused sessions, and the controller demotes at most two capabilities per session."""
+    env = dict(env, TE_TOOLPRUNE="auto", TE_TOOLPRUNE_QUIET_MINUTES="600")
+    alone = dict(env, TOKENECONOMIZER_HOME=env["TOKENECONOMIZER_HOME"] + "-alone",
+                 TE_HISTORY_IMPORT="off")
+    for i in range(5):
+        rollout(codex_home, repo, cx(i), cx_trap(i) * 2, age_s=3600 * (10 - i))
+    cx_start(env, repo, cx(50), tmp_path)
+    st, st_alone = store_for(env, repo, "codex"), store_for(alone, repo, "codex")
+    assert st.read("history.json")["imported"] == 5
+
+    def held(store):
+        return set(((store.read("untool.json") or {}).get("auto_pending") or {}).get("items")
+                   or ())
+    ever = set()
+    for n in range(1, 6):
+        cx_folded_live(env, repo, tmp_path, n, prompts=15)
+        cx_folded_live(alone, repo, tmp_path, n, prompts=15)
+        assert held(st) == held(st_alone), n
+        ever |= held(st)
+        if n <= 3:
+            assert "image_media" not in held(st), n
+    assert "image_media" in ever                         # the live sessions do get there
+    assert "image_media" in st.read("untool.json")["proposal"]
+    assert not os.path.exists(denylist.settings_path(repo, "codex"))
+
+
+def test_where_codex_keeps_its_rollouts(tmp_path):
+    home = tmp_path / "codex"
+    day = home / "sessions" / "2026" / "11" / "02"
+    day.mkdir(parents=True)
+    (home / "archived_sessions").mkdir()
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    a = f"rollout-2026-11-02T10-00-00-{cx(1)}.jsonl"
+    for p in (day / a, day / (a + ".zst"), day / "notes.jsonl",
+              home / "archived_sessions" / f"rollout-2026-11-01T09-00-00-{cx(2)}.jsonl.zst",
+              extra / f"rollout-2026-10-01T09-00-00-{cx(3)}.jsonl"):
+        p.write_text("{}\n")
+    logs = hosts.Codex().history({"CODEX_HOME": str(home)}, [str(extra), str(home)])
+    assert [(x["session_id"], os.path.basename(x["path"])) for x in logs] == [
+        (cx(1), a), (cx(2), f"rollout-2026-11-01T09-00-00-{cx(2)}.jsonl.zst"),
+        (cx(3), f"rollout-2026-10-01T09-00-00-{cx(3)}.jsonl")]
+    assert trace.codex_rollout_id(f"rollout-2026-11-02T10-00-00-{cx(4)}.jsonl.zst") == cx(4)
+    assert trace.codex_rollout_id("rollout-x.jsonl") is None
+    assert trace.codex_home({"CODEX_HOME": "/c"}) == "/c"
+
+
+def test_codex_turn_calls_are_what_the_live_hooks_saw(tmp_path):
+    path = rollout(tmp_path / "codex", "/w", cx(0), cx_trap(0) + cx_looked(), aborted={1})
+    turns = list(trace.codex_prompt_turns(path))
+    assert len(turns) == 2
+    assert trace.codex_turn_calls(turns[0]) == [
+        ("apply_patch", {"path": os.path.join("/w", "pkg/mod0.py"),
+                         "paths": [os.path.join("/w", "pkg/mod0.py")]}, "", None),
+        ("bash", {"command": "pytest -q tests/test_a.py"}, "bash: pytest: command not found",
+         127),
+        ("bash", {"command": "python -m pytest -q tests/test_a.py"}, "1 passed in 0.1s", 0)]
+    assert trace.codex_turn_completed(turns[0]) and not trace.codex_turn_interrupted(turns[0])
+    assert trace.codex_turn_interrupted(turns[1]) and not trace.codex_turn_completed(turns[1])
+    head = trace.codex_rollout_head(path)
+    assert head["session_id"] == cx(0) and head["cwd"] == "/w" and not head["headless"]
+    exe = rollout(tmp_path / "codex", "/w", cx(1), cx_trap(1), source="exec",
+                  originator="codex_exec", compressed=_zstd is not None)
+    assert hosts.Codex().headless({}, exe) is (_zstd is not None)

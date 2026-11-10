@@ -13,7 +13,7 @@ the hooks run) and `plugin/` (the packaging for each agent). To install and use 
 
 | Hook | What the plugin does | Mechanism it drives |
 |---|---|---|
-| `SessionStart` | Injects the repository's micro-skills (a cached render) as `additionalContext`, at a new start, and on a Copilot resume the text that session started with (§3); announces changed facts, tools the deny list newly left out, or, under `toolprune=propose` (or when `auto` could not write the file), a proposal still waiting, each in one `systemMessage` line; folds any earlier session whose end was never seen; on Claude Code with `history_import` on, the first time in a repository with nothing folded, starts a detached `te history import` of its sessions from before the plugin, and says once when that is done | microskills |
+| `SessionStart` | Injects the repository's micro-skills (a cached render) as `additionalContext`, at a new start, and on a Copilot resume the text that session started with (§3); announces changed facts, tools the deny list newly left out, or, under `toolprune=propose` (or when `auto` could not write the file), a proposal still waiting, each in one `systemMessage` line; folds any earlier session whose end was never seen; on Claude Code or Codex with `history_import` on, the first time in a repository with nothing folded, starts a detached `te history import` of its sessions from before the plugin, and says once when that is done | microskills |
 | `UserPromptSubmit` | Opens a prompt-turn for the loop guard | loopguard |
 | `PostToolUse` | Folds the call into the turn's guard; delivers a redirect as `additionalContext`, then, if the turn is still stuck, a one-line notice to the person (on Claude Code, also as context asking the model to repeat it); never stops the turn | loopguard |
 | `PostToolUseFailure` | The same, for a call that failed (Claude Code and Copilot report a failed call only here); the answer names this event, as Claude Code requires | loopguard |
@@ -44,21 +44,27 @@ re-tuned. Three things it adds:
   the hook. The hook starts the job and returns; a later PostToolUse picks up the verdict, with
   the redirect already written. Each job's spend is charged to the ledger when it is spent.
 
-**Earlier sessions** (`plugin/history.py`). Claude Code keeps every session's log, so the
-sessions a repository ran before the plugin was installed can be folded too: `te history
+**Earlier sessions** (`plugin/history.py`). Claude Code and Codex keep every session's log,
+so the sessions a repository ran before the plugin was installed can be folded too: `te history
 import`, which the first session start in a repository runs by itself when `history_import` is
-on (it is off by default). Which
-logs are the repository's is decided as for a live session, by `repo_identity` of the directory
-each log records; where that directory is gone, by an exact match of the log's folder with the
-one Claude Code derives from the repository's root. A log written in the last ten minutes, one
-already folded or recorded by the plugin's hooks, one with no prompt, one over 256 MB, one older
-than `history_days`, and a one-prompt SDK run (`claude -p`) are left out, and the newest
-`history_max_sessions` are folded, oldest first. Folding treats each session as the newest so
+on (it is off by default), once per agent. Claude Code's logs are read from
+`~/.claude/projects/`; Codex's rollouts from `~/.codex/sessions/` and `archived_sessions/`
+(or under `CODEX_HOME`), the compressed ones (`.jsonl.zst`) through the standard library's
+`compression.zstd`, so only on Python 3.14 or later (before that they are left out and counted as
+`compressed`). Which logs are the repository's is decided as for a live session, by
+`repo_identity` of the directory each log records; where that directory is gone, a Claude Code
+log by an exact match of its folder with the one Claude Code derives from the repository's root,
+and a Codex rollout not at all. A log written in the last ten minutes, one already folded or
+recorded by the plugin's hooks, one with no prompt, one over 256 MB (decompressed), one older
+than `history_days`, a one-prompt SDK run (`claude -p`), any `codex exec` run, and a Codex
+subagent's own rollout are left out, and the newest `history_max_sessions` are folded, oldest
+first. Folding treats each session as the newest so
 far, so the import keeps time order: it runs only into a store with nothing folded yet (otherwise
 `history.json` records the skip, and `te history import` refuses with the reason); it holds the
 repository's fold lock for its whole run, and while it runs or waits to resume, a session that
 ends stays unfolded and is folded after it; a run stopped by its 30-minute budget resumes the
-plan it saved, in order, and one whose heartbeat went stale is restarted by the next session
+plan it saved, in order (a Codex rollout compressed, archived or unarchived since is found
+where it is now), and one whose heartbeat went stale is restarted by the next session
 start. A session whose fold fails, or that the import's process died on twice, is left out. An
 imported session is folded only to learn from: against the tools its own log shows
 (never today's catalog), with no model call, no deny rule held, written or given back, and a
@@ -724,11 +730,12 @@ Which repository a session belongs to (`plugin/paths.py`, `plugin/repos.py`):
   `merged/`, displaced learned state to `premerge-*`. `te repos merge KEY [INTO]` joins two by
   hand, for state whose checkouts are gone.
 
-Besides the logs of the sessions whose hooks it sees, the plugin reads Claude Code's own logs
-once per repository, for the import of its earlier sessions (with `history_import` on, or `te
-history import`; off by default):
-the head of each log under `~/.claude/projects/` (or `CLAUDE_CONFIG_DIR`, and `history_dirs`), to
-tell which are the repository's, and those in full.
+Besides the logs of the sessions whose hooks it sees, the plugin reads Claude Code's and
+Codex's own logs once per repository and agent, for the import of its earlier sessions (with
+`history_import` on, or `te history import`; off by default): the head of each log under
+`~/.claude/projects/` (or `CLAUDE_CONFIG_DIR`), or of each rollout under `~/.codex/sessions/` and
+`archived_sessions/` (or `CODEX_HOME`), and under `history_dirs`, to tell which are the
+repository's, and those in full.
 
 The state directory, like the agents' own session logs it is derived from, is private to you:
 the plugin creates it `0700` and its files `0600`, and tightens a looser one it finds.
@@ -746,7 +753,7 @@ it, of `toolprune measure` on Claude Code. Those calls send
 masked, never file contents — through your own agent CLI (`claude -p` / `codex exec` /
 `copilot -p` / `pi -p` / `opencode run` / `grok -p` / `hermes chat`), billed where your session is. The proposer keeps the digests of the last eight
 sessions with its state, raw commands and output capped, so that each run sees more than the
-session that just ended. Sessions imported from Claude Code's history call no model, but their
+session that just ended. Sessions imported from an agent's history call no model, but their
 digests join that window, so the proposer's next call can include digests of sessions from
 before the plugin.
 
@@ -830,6 +837,7 @@ open-vocabulary. On a repository you do not trust, leave micro-skills off (the d
     sees only the tools sessions used (plus, on Claude Code, the deferred ones). Running it at
     an agent's first session on a machine would close that gap.
 * Windows beyond Claude Code (Codex, the Copilot CLI and Pi there are untested; Copilot's `-p` is
-  not told apart, having no `ps`), Python 3.9, and compressed Codex rollouts (`.zst`).
+  not told apart, having no `ps`), Python 3.9, and compressed Codex rollouts (`.zst`) before
+  Python 3.14, which has no `compression.zstd`.
 * Transcript formats are internal to each agent and change between versions; the readers are
   pinned by tests against the shapes observed on the versions above.

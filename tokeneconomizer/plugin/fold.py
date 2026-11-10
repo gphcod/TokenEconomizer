@@ -125,7 +125,8 @@ def _fold_toolprune(ctx, adapter, run_dir, session_id, transcript=None, workdir=
     if not denylist.supports(ctx.host.name) or ctx.config.toolprune == "off":
         return None
     if ctx.host.name == "codex":
-        return _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts)
+        return _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts,
+                                     imported=imported)
     host = ctx.host.name
     from tokeneconomizer.config import ToolingConfig
     from tokeneconomizer.toolprune import ToolingStage
@@ -256,7 +257,8 @@ def _server_summary(stage, servers, prompt_streaks):
     return out
 
 
-def _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts=None):
+def _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts=None,
+                          imported=False):
     """Codex: the experiments' capability controller (`codex_untool.CodexUntoolProfile`, driven
     through `ToolingStage`) decides which packages went unused, over a trace that carries the
     model's own `exec` calls (`trace.codex_capability_trace`). Two live adaptations:
@@ -267,7 +269,14 @@ def _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts
         unused, long enough by `enough_evidence` (x3 for image/media, the high-risk package),
         with no use ever -- the profile alone demotes collaboration after one unused task, which
         was right for a sealed benchmark stream and is too quick for a person's sessions. The
-        profile counts sessions; the prompts are counted here (`loaded_prompts`)."""
+        profile counts sessions; the prompts are counted here (`loaded_prompts`).
+
+    A session read from Codex's history (`imported`) is handled as `_fold_toolprune` handles
+    one: it ran under no capability the plugin applied, holds and writes nothing, and keeps what
+    waits; once there are such sessions, the plugin's own are counted apart (`live_loaded`,
+    `live_loaded_prompts`, and a second controller over them alone) and `auto` holds only what
+    they alone would have demoted and are enough evidence for, the rest waiting in
+    `needs_apply` for `toolprune apply`."""
     from tokeneconomizer.config import ToolingConfig
     from tokeneconomizer.toolprune import ToolingStage
     if not transcript or not workdir:
@@ -284,7 +293,8 @@ def _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts
     stage.build_tools({"instance_id": session_id}, 0)
     applied = denylist.applied_for(ctx.store, ctx.repo.root, ctx.host.name)
     kept = set(denylist.kept_for(ctx.store, ctx.repo.root, ctx.host.name))   # given back
-    stage.codex_profile._pending["logical_capabilities"] = sorted(applied)
+    # The mask this session actually ran under: none, for one from before the plugin.
+    stage.codex_profile._pending["logical_capabilities"] = [] if imported else sorted(applied)
     loaded_before = dict(stage.codex_profile.state.get("loaded_exposures") or {})
     srow = {}
     stage.after_task({"instance_id": session_id}, {}, run_dir, srow)
@@ -295,10 +305,29 @@ def _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts
     # A session from before prompts were counted counts as one prompt.
     loaded_prompts = dict(prior.get("loaded_prompts") or
                           {c: int(n) for c, n in loaded_before.items()})
+    imported_n = int(prior.get("imported_sessions", 0)) + bool(imported)
+    live_loaded = {c: int(n) for c, n in (prior.get("live_loaded") or {}).items()}
+    live_prompts = {c: int(n) for c, n in (prior.get("live_loaded_prompts") or {}).items()}
     for c in denylist.CODEX_LIVE_CAPABILITIES:
         if int(loaded.get(c, 0)) > int(loaded_before.get(c, 0)):     # loaded this session
-            loaded_prompts[c] = int(loaded_prompts.get(c, 0)) + (1 if prompts is None
-                                                                 else prompts)
+            n = 1 if prompts is None else prompts
+            loaded_prompts[c] = int(loaded_prompts.get(c, 0)) + n
+            if not imported:
+                live_loaded[c] = live_loaded.get(c, 0) + 1
+                live_prompts[c] = live_prompts.get(c, 0) + n
+    # Once history was imported, the same controller also runs over the plugin's own sessions
+    # alone (its state in `mechanisms/live`), so that `auto` holds only what it, too, demoted:
+    # history must not hasten a demotion, which goes by order and at most two per session.
+    live_pruned = set()
+    if imported_n and not imported:
+        live = ToolingStage(ToolingConfig(codex_untool=True), "codex", "agent", adapter=adapter,
+                            repo=ctx.repo.label,
+                            results_root=os.path.join(ctx.mech_dir, "live"), fresh=False)
+        live._warned_no_catalog = True
+        live.build_tools({"instance_id": session_id}, 0)
+        live.codex_profile._pending["logical_capabilities"] = sorted(applied)
+        live.after_task({"instance_id": session_id}, {}, run_dir, {})
+        live_pruned = set(live.codex_profile.state.get("current_pruned") or ())
     proposal = [c for c in denylist.CODEX_LIVE_CAPABILITIES
                 if c in (state.get("current_pruned") or ()) and c not in ever_used
                 and c not in applied and c not in kept
@@ -315,8 +344,32 @@ def _fold_toolprune_codex(ctx, adapter, session_id, transcript, workdir, prompts
            "loaded_prompts": loaded_prompts,
            "proposal": proposal, "updated": time.time(),
            "new_in_proposal": sorted(set(proposal) - set(prior.get("proposal", [])))}
-    if ctx.config.toolprune == "auto" and proposal and not ctx.config.shadow:
-        _hold(doc, prior, proposal, ctx.repo.root)
+    if imported_n:
+        doc.update({"imported_sessions": imported_n,
+                    "imported_prompts": int(prior.get("imported_prompts", 0))
+                    + ((prompts or 0) if imported else 0),
+                    "live_loaded": live_loaded, "live_loaded_prompts": live_prompts})
+    if imported:
+        # A session from Codex's history writes nothing and drops nothing that waits; what it
+        # proposes waits for `toolprune apply`.
+        for key in ("auto_pending", "auto_apply_refused"):
+            if prior.get(key):
+                doc[key] = prior[key]
+        held = set((doc.get("auto_pending") or {}).get("items") or [])
+        doc["needs_apply"] = [c for c in proposal if c not in held]
+    elif ctx.config.toolprune == "auto" and proposal and not ctx.config.shadow:
+        held = proposal
+        if imported_n:
+            # The plugin's own sessions must be enough evidence alone, for the controller's
+            # demotion (`live_pruned`) as for `enough_evidence`: what rests on history waits for
+            # `toolprune apply`.
+            held = [c for c in proposal
+                    if c in live_pruned
+                    and enough_evidence(live_loaded.get(c, 0), live_prompts.get(c, 0),
+                                        ctx.config, high_risk=c in CODEX_HIGH_RISK)]
+            doc["needs_apply"] = [c for c in proposal if c not in held]
+        if held:
+            _hold(doc, prior, held, ctx.repo.root)
     ctx.store.write("untool.json", doc)
     return {"proposal": doc["proposal"], "pending": bool(doc.get("auto_pending")),
             "restored": []}

@@ -19,11 +19,11 @@
     te config unset KEY ...           back to the next source down (the global file, then default)
     te repomap [show | refresh]       the repository map (`repomap=on`): what is cached, or
                                       make it now
-    te history import [--dry-run]     Claude Code: fold this repository's sessions from before
-                                      the plugin, from Claude Code's own logs (no model calls,
-                                      no deny list written; only before any session is folded;
-                                      with `history_import=on`, the first session start runs
-                                      it by itself)
+    te history import [--dry-run]     Claude Code and Codex: fold this repository's sessions
+                                      from before the plugin, from the agent's own logs (no
+                                      model calls, no deny list written; only before any
+                                      session is folded; with `history_import=on`, the first
+                                      session start runs it by itself)
     te history [import --status]      what that import did here
     te repos                          every repository with state here: how it was identified,
                                       its agents and sessions, the checkouts seen
@@ -264,7 +264,7 @@ def cmd_status(args):
           f"{accounting.fmt_tokens(ledger['effective_tokens'])} effective tokens, plugin "
           f"overhead {accounting.fmt_tokens(ledger['overhead_tokens'])} "
           f"({ledger['overhead_frac']:.1%})")
-    hist = history.describe(out["history"])
+    hist = history.describe(out["history"], ctx.host.name)
     if hist:
         print(f"  history      {hist}")
     i = out["microskills"]
@@ -654,7 +654,7 @@ def _print_history(ctx, doc):
         print(f"no import of earlier sessions recorded for {ctx.repo.label}"
               + ("" if ctx.config.history_import else " (history_import is off)"))
         return
-    print(f"{ctx.repo.label}: {history.describe(doc) or doc.get('state')}")
+    print(f"{ctx.repo.label}: {history.describe(doc, ctx.host.name) or doc.get('state')}")
     skipped = doc.get("skipped") if isinstance(doc.get("skipped"), dict) else {}
     if doc.get("over_limit"):
         skipped = dict(skipped, older_than_the_newest=doc["over_limit"])
@@ -663,13 +663,15 @@ def _print_history(ctx, doc):
 
 
 def cmd_history(args):
-    """`te history [import]`: a repository's sessions from before the plugin (Claude Code)."""
+    """`te history [import]`: a repository's sessions from before the plugin (Claude Code,
+    Codex)."""
     ctx = _ctx(args)
     if args.action == "status" or args.status:
         _print_history(ctx, history.summary(ctx))
         return 0
     if not ctx.host.keeps_history:
-        print(f"{ctx.host.name}: no session history the plugin reads (Claude Code only)")
+        print(f"{ctx.host.name}: no session history the plugin reads (Claude Code and Codex "
+              f"only)")
         return 1
     if args.dry_run:
         p = history.plan(ctx)

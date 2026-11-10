@@ -21,9 +21,12 @@ from .claude import (claude_calls, claude_deferred_tools, claude_history_logs,
                      claude_prompt_count, claude_prompt_turns, claude_safe_session_id,
                      claude_session_usage, claude_subagent_files, claude_tool_usage,
                      claude_turn_answered, claude_turn_interrupted)
-from .codex import (codex_capability_trace, codex_exec_calls, codex_prompt_count,
-                    codex_rollout_to_exec, codex_session_meta, codex_session_usage,
-                    rollout_item_to_exec)
+from .codex import (codex_capability_trace, codex_exec_calls, codex_history_logs, codex_home,
+                    codex_prompt_count, codex_prompt_turns, codex_rollout_date_dir,
+                    codex_rollout_head, codex_rollout_id, codex_rollout_to_exec,
+                    codex_session_meta, codex_session_usage, codex_turn_calls,
+                    codex_turn_completed, codex_turn_interrupted, rollout_item_to_exec)
+from .jsonl import Unreadable, decompressed_size, readable
 from .copilot import (copilot_event_calls, copilot_mcp_servers, copilot_prompt_count,
                       copilot_session_meta, copilot_session_usage, copilot_turns,
                       mcp_server_of)
@@ -49,8 +52,11 @@ __all__ = [
     "claude_project_folder", "claude_projects_dir", "claude_prompt_count", "claude_prompt_turns",
     "claude_safe_session_id", "claude_session_usage", "claude_subagent_files",
     "claude_tool_usage", "claude_turn_answered", "claude_turn_interrupted",
-    "codex_capability_trace", "codex_exec_calls", "codex_prompt_count", "codex_rollout_to_exec",
-    "codex_session_meta", "codex_session_usage", "rollout_item_to_exec",
+    "codex_capability_trace", "codex_exec_calls", "codex_history_logs", "codex_home",
+    "codex_prompt_count", "codex_prompt_turns", "codex_rollout_date_dir", "codex_rollout_head",
+    "codex_rollout_id", "codex_rollout_to_exec", "codex_session_meta", "codex_session_usage",
+    "codex_turn_calls", "codex_turn_completed", "codex_turn_interrupted", "rollout_item_to_exec",
+    "Unreadable", "decompressed_size", "readable",
     "copilot_event_calls", "copilot_mcp_servers", "copilot_prompt_count", "copilot_session_meta",
     "copilot_session_usage", "copilot_turns", "mcp_server_of",
     "antigravity_prompt_count", "antigravity_read", "antigravity_session_to_claude",

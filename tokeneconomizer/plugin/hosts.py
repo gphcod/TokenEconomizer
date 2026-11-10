@@ -377,12 +377,7 @@ class Codex(Host):
         # The rollout's first record names its front end: `source: "exec"`, originator
         # `codex_exec` under `codex exec`; `codex-tui` in the terminal UI (0.163.0). The hook's
         # payload and environment are the same in both.
-        try:
-            with open(transcript or "", encoding="utf-8") as fh:
-                meta = (json.loads(fh.readline()) or {}).get("payload") or {}
-        except (OSError, ValueError, AttributeError):
-            return False
-        return meta.get("source") == "exec" or str(meta.get("originator", "")) == "codex_exec"
+        return bool(trace.codex_rollout_head(transcript or "")["headless"])
 
     def mechanism_trace(self, transcript_path, workdir):
         out = os.path.join(workdir, "codex_exec_trace.jsonl")
@@ -394,6 +389,42 @@ class Codex(Host):
 
     def prompt_count(self, transcript_path):
         return trace.codex_prompt_count(transcript_path)
+
+    keeps_history = True
+
+    def history_dirs(self, env, extra_dirs=()):
+        """The folders Codex keeps rollouts in: `$CODEX_HOME/sessions` (else `~/.codex`), then
+        `archived_sessions`, where archiving a conversation moves its rollout; then each of
+        `extra_dirs`, a Codex home holding those folders or itself a folder of rollouts."""
+        home = trace.codex_home(env)
+        dirs = [os.path.join(home, "sessions"), os.path.join(home, "archived_sessions")]
+        for d in extra_dirs or ():
+            d = os.path.expanduser(str(d))
+            inner = [os.path.join(d, n) for n in ("sessions", "archived_sessions")
+                     if os.path.isdir(os.path.join(d, n))]
+            dirs.extend(inner or [d])
+        out, seen = [], set()
+        for d in dirs:
+            real = os.path.realpath(d)
+            if real not in seen:
+                seen.add(real)
+                out.append(d)
+        return out
+
+    def history(self, env, extra_dirs=()):
+        """Every rollout in `history_dirs`, by the thread id its file name ends with: a
+        session found twice (a compressed copy, an archived one) is listed once, from the
+        first."""
+        out, seen = [], set()
+        for d in self.history_dirs(env, extra_dirs):
+            for path, mtime, size in trace.codex_history_logs(d):
+                sid = trace.codex_rollout_id(path)
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                out.append({"session_id": sid, "folder": None, "path": path, "mtime": mtime,
+                            "size": size})
+        return out
 
 
 class Pi(Host):

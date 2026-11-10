@@ -1,22 +1,29 @@
 """Importing a repository's sessions from before the plugin, from the agent's own session logs.
 
-The plugin learns from sessions it sees end. Claude Code keeps every session's log
-(`~/.claude/projects/<folder>/<session id>.jsonl`, or under `$CLAUDE_CONFIG_DIR`), so the
-sessions a repository ran before the plugin was installed can be folded too, once, and learning
-starts at install rather than some sessions later. `te history import` does it; with
+The plugin learns from sessions it sees end. Claude Code and Codex keep every session's log, so
+the sessions a repository ran before the plugin was installed can be folded too, once, and
+learning starts at install rather than some sessions later. `te history import` does it; with
 `history_import` on (it is off by default), the first session start in a repository starts it
-by itself, in a detached process.
+by itself, in a detached process. Each agent's logs are read by its own reader (`_LOGS`):
+
+  * Claude Code: `~/.claude/projects/<folder>/<session id>.jsonl`, or under `$CLAUDE_CONFIG_DIR`;
+  * Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl`, or under
+    `$CODEX_HOME`, compressed later to `.jsonl.zst` (read where the standard library can
+    decompress it, Python 3.14 on; elsewhere left out as `compressed`), and moved to
+    `archived_sessions/` when the conversation is archived.
 
 Which logs are this repository's: each log's recorded directory is keyed with `repo_identity`,
 as a live session's is. Where that directory no longer exists (a moved checkout, a renamed
 home), Claude Code has moved the log to the folder it derives from the directory's new path, so
 the log's folder name is matched EXACTLY against the one Claude Code derives from the
 repository's root (`trace.claude_project_folder`): never a prefix, or `widget-shell` would be
-taken for `widget`. Left out: a log written in the last `fold.STALE_S` (its session may still be
+taken for `widget`. Codex never moves a rollout, so a rollout whose directory is gone is no
+repository's. Left out: a log written in the last `fold.STALE_S` (its session may still be
 running), one already folded or recorded by the plugin's own hooks, one with no prompt, one over
-`MAX_BYTES`, one older than `history_days`, and a one-prompt SDK run (`claude -p`, a script),
-whose restricted tools and long autonomous turns say little about the person's own sessions.
-The newest `history_max_sessions` are kept, and folded oldest first.
+`MAX_BYTES` (decompressed), one older than `history_days`, a one-prompt SDK run (`claude -p`, a
+script) and any `codex exec` run, whose restricted tools and long autonomous turns say little
+about the person's own sessions, and a Codex subagent's own rollout, whose work belongs to the
+session that spawned it. The newest `history_max_sessions` are kept, and folded oldest first.
 
 Time order is the point of most of what follows. Folding treats each session as the newest so
 far: a fact recent sessions no longer support would come back, and tools in use lately would
@@ -30,7 +37,8 @@ look long unused, if older sessions were folded after newer ones. So:
     lock is taken, so a session's end never waits on the import): the session stays pending,
     and the import folds the pending sessions, oldest first, once it is done;
   * the plan -- the ordered session ids and paths -- is saved, and a run stopped by its time
-    budget (`BUDGET_S`) is `partial` and resumes the same plan in the same order. The run
+    budget (`BUDGET_S`) is `partial` and resumes the same plan in the same order (a Codex
+    rollout compressed, archived or unarchived since is found where it is now). The run
     refreshes a heartbeat; one gone stale (`HEARTBEAT_STALE_S`: the process died) lets the next
     session start restart it, so live folding cannot stay blocked. A session whose fold fails is
     counted as skipped and not tried again, and so is one the import's process died on
@@ -63,7 +71,7 @@ STATE = fold.HISTORY
 LOG = "history.log"
 BUDGET_S = 1800                    # one run's time budget; a longer import resumes next time
 HEARTBEAT_STALE_S = 900            # a running import this quiet has died
-MAX_BYTES = 256 * 1024 * 1024      # a log larger than this is not read
+MAX_BYTES = 256 * 1024 * 1024      # a log larger than this (decompressed) is not read
 HISTORY_LOCK_S = 1.0               # a session start's wait for `history.json` (then next time)
 MAX_ATTEMPTS = 2                   # runs that died on one session before it is left out
 _clock = time.monotonic            # the run's budget clock
@@ -160,6 +168,8 @@ def is_this_repository(ctx, folder, cwd, cache=None):
     cache = {} if cache is None else cache
     if cwd and os.path.isdir(cwd):
         return _identity(cwd, ctx.env, cache) == ctx.repo.key
+    if folder is None:
+        return False
     root = ctx.repo.root
     names = {trace.claude_project_folder(root), trace.claude_project_folder(os.path.realpath(root))}
     return folder in names
@@ -171,42 +181,193 @@ def _headless(head, prompts):
     return prompts <= 1 and str(head.get("entrypoint") or "").lower().startswith("sdk")
 
 
+class _ClaudeLogs:
+    """Claude Code's logs: `<projects>/<folder>/<session id>.jsonl`, the id in the file name."""
+    agent = "Claude Code"
+
+    def head(self, path):
+        return trace.claude_log_head(path)
+
+    def session_id(self, log, head):
+        return trace.claude_safe_session_id(log["session_id"])
+
+    def is_this_repository(self, ctx, log, head, cache):
+        return is_this_repository(ctx, log["folder"], head.get("cwd"), cache)
+
+    def owns(self, path, sid):
+        return os.path.basename(path) == f"{sid}.jsonl"
+
+    def locate(self, ctx, path, sid):
+        return path if os.path.exists(path) else None
+
+    def size(self, path, on_disk=None):
+        return on_disk if on_disk is not None else os.path.getsize(path)
+
+    def prompts(self, path):
+        return trace.claude_prompt_count(path)
+
+    def left_out(self, head, prompts):
+        return "headless" if _headless(head, prompts) else None
+
+    def turns(self, path):
+        """Each prompt-turn as ([(name, args, result, exit code)], stopped normally). A failed
+        call's code is its "Exit code N"; a successful shell call's is 0 where
+        `claude_success_code` gives it, else none. A turn stopped normally when the person did
+        not interrupt it and, for the session's last turn, it was answered (a log cut off
+        mid-turn did not stop normally)."""
+        turns = trace.claude_prompt_turns(path)
+        turn = next(turns, None)
+        while turn is not None:
+            following = next(turns, None)
+            calls = []
+            for name, args, result, ok, _cwd in trace.claude_calls(turn):
+                result = (result or "")[:RESULT_CAP]
+                if ok:
+                    code = claude_success_code(name, args)
+                else:
+                    m = _EXIT_RE.search(result[:400])
+                    code = int(m.group(1)) if m else None
+                calls.append((name, args if isinstance(args, dict) else {}, result, code))
+            normal = not trace.claude_turn_interrupted(turn) and (
+                following is not None or trace.claude_turn_answered(turn))
+            yield calls, normal
+            turn = following
+
+
+class _CodexLogs:
+    """Codex's rollouts: `rollout-<time>-<thread id>.jsonl[.zst]`, whose `session_meta` record
+    must name the same thread id (the live hooks' session id)."""
+    agent = "Codex"
+
+    def head(self, path):
+        return trace.codex_rollout_head(path)
+
+    def session_id(self, log, head):
+        sid = trace.claude_safe_session_id(log["session_id"])
+        return sid if sid is not None and head.get("session_id") == sid else None
+
+    def is_this_repository(self, ctx, log, head, cache):
+        cwd = head.get("cwd")
+        return bool(cwd) and os.path.isdir(cwd) and _identity(cwd, ctx.env, cache) == ctx.repo.key
+
+    def owns(self, path, sid):
+        return trace.codex_rollout_id(path) == sid
+
+    def locate(self, ctx, path, sid):
+        """Where a planned rollout is now. Codex may have compressed it since the plan
+        (`.jsonl` -> `.jsonl.zst`), archived it (`sessions/YYYY/MM/DD/` -> `archived_sessions/`)
+        or unarchived it; the same file name, with or without `.zst`, is looked for where it
+        was and in each folder Codex files rollouts in."""
+        name = os.path.basename(path)
+        plain = name[:-len(".zst")] if name.endswith(".zst") else name
+        dated = trace.codex_rollout_date_dir(plain)
+        dirs = [os.path.dirname(path)]
+        for d in ctx.host.history_dirs(ctx.env, ctx.config.history_dirs):
+            dirs.append(d)
+            if dated:
+                dirs.append(os.path.join(d, dated))
+        for d in dirs:
+            for n in (plain, plain + ".zst"):
+                p = os.path.join(d, n)
+                if os.path.isfile(p) and trace.codex_rollout_id(p) == sid:
+                    return p
+        return None
+
+    def size(self, path, on_disk=None):
+        """The rollout's bytes once decompressed (a compressed one is counted, up to the cap)."""
+        if on_disk is not None and trace.readable(path) and not path.endswith(".zst"):
+            return on_disk
+        return trace.decompressed_size(path, MAX_BYTES)
+
+    def prompts(self, path):
+        return trace.codex_prompt_count(path)
+
+    def left_out(self, head, prompts):
+        if head.get("subagent"):
+            return "subagent"
+        if head.get("headless"):
+            return "headless"
+        return None
+
+    def turns(self, path):
+        """Each prompt-turn as ([(name, args, result, exit code)], stopped normally): the calls
+        as the live hooks would have folded them (`trace.codex_turn_calls`), with the exit codes
+        Codex recorded. A turn stopped normally when the person did not stop it (`turn_aborted`)
+        and, for the session's last turn, it ran to its end (`task_complete`)."""
+        turns = trace.codex_prompt_turns(path)
+        turn = next(turns, None)
+        while turn is not None:
+            following = next(turns, None)
+            calls = [(name, args, (result or "")[:RESULT_CAP], code)
+                     for name, args, result, code in trace.codex_turn_calls(turn)]
+            normal = not trace.codex_turn_interrupted(turn) and (
+                following is not None or trace.codex_turn_completed(turn))
+            yield calls, normal
+            turn = following
+
+
+_LOGS = {"claude": _ClaudeLogs(), "codex": _CodexLogs()}
+
+
+def _logs(ctx):
+    """The reader of this agent's own session logs; None where the plugin reads none."""
+    if not getattr(ctx.host, "keeps_history", False):
+        return None
+    return _LOGS.get(ctx.host.name)
+
+
+def _source(host_name):
+    """Where an import reads from, for what the plugin prints: "Codex's history"."""
+    reader = _LOGS.get(host_name)
+    return f"{reader.agent}'s history" if reader else "the agent's history"
+
+
 def plan(ctx, now=None):
     """What an import would fold here, and why the rest is left out; reads, never writes.
 
     Returns {"sessions": [{"id", "path", "started", "ended"}] oldest first, "skipped": {why: n},
-    "over_limit": n}."""
+    "over_limit": n}. A Codex rollout this Python cannot decompress is counted as `compressed`
+    whichever repository it is from: what it records cannot be read."""
     now = time.time() if now is None else now
     cfg = ctx.config
+    reader = _logs(ctx)
+    if reader is None:
+        return {"sessions": [], "skipped": {}, "over_limit": 0}
     folded = ctx.store.read("folded.json") or {}
     skipped, found, cache = {}, [], {}
 
     def skip(why):
         skipped[why] = skipped.get(why, 0) + 1
     for log in ctx.host.history(ctx.env, cfg.history_dirs):
-        head = trace.claude_log_head(log["path"])
-        if not is_this_repository(ctx, log["folder"], head.get("cwd"), cache):
+        if not trace.readable(log["path"]):
+            skip("compressed")
             continue
-        sid = trace.claude_safe_session_id(log["session_id"])
-        mtime, size = log["mtime"], log["size"]
+        head = reader.head(log["path"])
+        if not reader.is_this_repository(ctx, log, head, cache):
+            continue
+        sid = reader.session_id(log, head)
+        mtime = log["mtime"]
         if sid is None:
             skip("unsafe_id")
         elif mtime > now - fold.STALE_S:
             skip("recent")                         # may be running
         elif mtime < now - cfg.history_days * 86400:
             skip("too_old")
-        elif size > MAX_BYTES:
-            skip("too_large")
         elif sid in folded:
             skip("already_folded")
         elif os.path.exists(ctx.store.path("sessions", f"{sid}.json")):
             skip("recorded_live")
         else:
-            prompts = trace.claude_prompt_count(log["path"])
-            if prompts <= 0:
-                skip("no_prompt")
-            elif _headless(head, prompts):
-                skip("headless")
+            try:
+                large = reader.size(log["path"], log["size"]) > MAX_BYTES
+            except OSError:
+                skip("unreadable")
+                continue
+            prompts = 0 if large else reader.prompts(log["path"])
+            why = ("too_large" if large else "no_prompt" if prompts <= 0
+                   else reader.left_out(head, prompts))
+            if why:
+                skip(why)
             else:
                 found.append({"id": sid, "path": log["path"],
                               "started": head.get("started") or mtime, "ended": mtime})
@@ -216,21 +377,30 @@ def plan(ctx, now=None):
 
 
 def _still_eligible(ctx, item):
-    """Why a planned session is no longer to be imported (a resumed plan), or None."""
+    """(why a planned session is no longer to be imported, or None; the path to read it from
+    now) -- for a resumed plan, whose log may have moved since."""
+    reader = _logs(ctx)
     sid = trace.claude_safe_session_id(item.get("id")) if isinstance(item, dict) else None
     path = item.get("path") if isinstance(item, dict) else None
-    if sid is None or not isinstance(path, str) or os.path.basename(path) != f"{sid}.jsonl":
-        return "unsafe_id"
+    if reader is None or sid is None or not isinstance(path, str) or not reader.owns(path, sid):
+        return "unsafe_id", None
     if sid in (ctx.store.read("folded.json") or {}):
-        return "already_folded"
+        return "already_folded", None
     if os.path.exists(ctx.store.path("sessions", f"{sid}.json")):
-        return "recorded_live"
+        return "recorded_live", None
+    path = reader.locate(ctx, path, sid)
+    if path is None:
+        return "gone", None
+    if not trace.readable(path):
+        return "compressed", None
     try:
-        if os.path.getsize(path) > MAX_BYTES:
-            return "too_large"
+        if reader.size(path) > MAX_BYTES:
+            return "too_large", None
     except OSError:
-        return "gone"
-    return None
+        return "unreadable", None
+    if reader.session_id({"session_id": sid}, reader.head(path)) != sid:
+        return "unsafe_id", None
+    return None, path
 
 
 # ---- the loop guard's envelope ---------------------------------------------------------------
@@ -239,37 +409,23 @@ def replay_envelope(ctx, transcript_path):
 
     Each prompt-turn is folded call by call into a fresh `TurnGuard` with no envelope and no
     judge, so nothing can redirect or stop it, and the result text and exit code it gets are the
-    ones a live hook would have (a failed call's "Exit code N", a successful shell call's 0 where
-    `claude_success_code` gives it, else none). A turn feeds the envelope, as a live one does,
-    when it stopped normally: not interrupted by the person, and, for the session's last turn,
-    answered (a log cut off mid-turn did not stop normally).
-    Returns the number of turns recorded."""
+    ones a live hook would have (the agent's reader says how: `_ClaudeLogs.turns`,
+    `_CodexLogs.turns`). A turn feeds the envelope, as a live one does, when it stopped
+    normally. Returns the number of turns recorded."""
     cfg = ctx.config
-    if cfg.loopguard == "off":
+    reader = _logs(ctx)
+    if cfg.loopguard == "off" or reader is None or not transcript_path:
         return 0
     level, overrides = cfg.loopguard_aggr, cfg.loopguard_thresholds
     thr = loopguard.base_thresholds(level, overrides)
     recorded = 0
-    turns = trace.claude_prompt_turns(transcript_path)
-    turn = next(turns, None)
-    while turn is not None:
-        following = next(turns, None)
+    for calls, normal in reader.turns(transcript_path):
         guard = loopguard.TurnGuard()
-        for name, args, result, ok, _cwd in trace.claude_calls(turn):
-            result = (result or "")[:RESULT_CAP]
-            if ok:
-                code = claude_success_code(name, args)
-            else:
-                m = _EXIT_RE.search(result[:400])
-                code = int(m.group(1)) if m else None
-            guard.fold(name, args if isinstance(args, dict) else {}, result, code,
-                       envelope=None, thr=thr, judge=None)
-        normal = not trace.claude_turn_interrupted(turn) and (
-            following is not None or trace.claude_turn_answered(turn))
+        for name, args, result, code in calls:
+            guard.fold(name, args, result, code, envelope=None, thr=thr, judge=None)
         if guard.cum_turns and normal:
             loopguard.record_turn(ctx.store, guard, level=level, overrides=overrides)
             recorded += 1
-        turn = following
     return recorded
 
 
@@ -309,7 +465,7 @@ def run(ctx, auto=False, now=None, budget_s=BUDGET_S, log=None):
     "reason"}: state "busy" when the fold lock stayed taken, "refused" when the import may not
     run here."""
     now = time.time() if now is None else now
-    if not getattr(ctx.host, "keeps_history", False):
+    if _logs(ctx) is None:
         return {"state": "refused", "reason": f"{ctx.host.name} keeps no session history "
                                               f"the plugin reads"}
     with ctx.store.locked("fold", timeout=fold.FOLD_LOCK_WAIT_S) as got:
@@ -401,7 +557,7 @@ def _import_one(ctx, doc, item, skipped, log):
     sid = item.get("id") if isinstance(item, dict) else None
     att = doc.get("attempt") if isinstance(doc.get("attempt"), dict) else {}
     tries = int(_num(att.get("n"))) if sid is not None and att.get("id") == sid else 0
-    why = _still_eligible(ctx, item)
+    why, path = _still_eligible(ctx, item)
     if why == "already_folded" and _folded_by_import(ctx.store, sid):
         # This import folded it, and its process died before it saved its place.
         doc["imported"] = int(_num(doc.get("imported"))) + 1
@@ -409,7 +565,7 @@ def _import_one(ctx, doc, item, skipped, log):
             doc["attempt"] = {"id": sid, "n": tries + 1}
             _save(ctx, doc)
             try:
-                replay_envelope(ctx, item["path"])
+                replay_envelope(ctx, _logs(ctx).locate(ctx, item["path"], sid))
             except Exception:
                 _record_error(ctx.root)
         return
@@ -422,12 +578,12 @@ def _import_one(ctx, doc, item, skipped, log):
     doc["attempt"] = {"id": sid, "n": tries + 1}
     _save(ctx, doc)
     try:
-        rec = fold.fold_locked(ctx, sid, item["path"], imported=True,
+        rec = fold.fold_locked(ctx, sid, path, imported=True,
                                span=(item.get("started"), item.get("ended")))
         if rec is not None and not rec.get("error"):
             doc["imported"] = int(_num(doc.get("imported"))) + 1
             try:
-                replay_envelope(ctx, item["path"])
+                replay_envelope(ctx, path)
             except Exception:
                 _record_error(ctx.root)
             _say(log, f"read {sid}")
@@ -444,7 +600,7 @@ def maybe_start(ctx, now=None):
     whose process died -- in a detached `te history import` (inline when TE_FOLD_SYNC=1, for
     tests). Reads only `history.json`, and `folded.json` and the ledger (when it is not empty)
     when there is no `history.json` yet. A store with folded sessions records the skip, once."""
-    if not getattr(ctx.host, "keeps_history", False):
+    if _logs(ctx) is None:
         return None
     now = time.time() if now is None else now
     exists = os.path.exists(ctx.store.path(STATE))
@@ -496,7 +652,7 @@ def notice(ctx):
     if _update(ctx, mark, timeout=HISTORY_LOCK_S) is None or not out.get("n"):
         return None
     return (f"TokenEconomizer read {out['n']} earlier session(s) of {ctx.repo.label} from "
-            f"Claude Code's history.")
+            f"{_source(ctx.host.name)}.")
 
 
 def summary(ctx):
@@ -510,16 +666,17 @@ def summary(ctx):
     return out
 
 
-def describe(doc):
-    """One line for `te status`: what the import did here."""
+def describe(doc, host_name="claude"):
+    """One line for `te status`: what the import did here (`host_name`: whose history)."""
     if not doc:
         return None
     state = doc.get("state")
     n = int(_num(doc.get("imported")))
+    source = _source(host_name)
     if state == "done":
-        return f"read {n} earlier session(s) from Claude Code's history"
+        return f"read {n} earlier session(s) from {source}"
     if state in fold.HISTORY_BLOCKING:
-        return (f"reading Claude Code's history: {n} session(s) so far, {doc.get('left', '?')} "
+        return (f"reading {source}: {n} session(s) so far, {doc.get('left', '?')} "
                 f"to go; sessions ending meanwhile are folded after it")
     if state == "skipped":
         return f"not read ({doc.get('reason') or 'skipped'})"

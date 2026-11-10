@@ -54,15 +54,21 @@ person can tune by hand:
                                    custom provider's, whose model they could not reach otherwise;
                                    comma-separated paths), and the `pi` they run;
   * hermes_cli                  -- on Hermes, the `hermes` the plugin's own model calls run;
-  * history_import              -- on Claude Code, fold a repository's sessions from before the
-                                   plugin (Claude Code's own logs) once, at its first session
-                                   start, when nothing is folded there yet. Off by default:
-                                   the plugin learns only from sessions it sees end, and
-                                   `te history import` reads them by hand;
+  * history_import              -- on Claude Code and on Codex, fold a repository's sessions
+                                   from before the plugin (the agent's own logs: Claude
+                                   Code's projects folder; Codex's rollouts in `sessions` and
+                                   `archived_sessions`, compressed ones from Python 3.14 on)
+                                   once, at its first session start on that agent, when
+                                   nothing is folded there yet. Off by default: the plugin
+                                   learns only from sessions it sees end, and `te history
+                                   import` reads them by hand;
   * history_max_sessions, history_days -- the newest sessions that import takes, and how far
                                    back it reads;
-  * history_dirs                -- further Claude Code `projects` folders to read, beside
-                                   `$CLAUDE_CONFIG_DIR/projects` (else `~/.claude/projects`).
+  * history_dirs                -- further folders of session logs to read: on Claude Code,
+                                   `projects` folders (or config folders holding one) beside
+                                   `$CLAUDE_CONFIG_DIR/projects` (else `~/.claude/projects`);
+                                   on Codex, Codex homes (or folders of rollouts) beside
+                                   `$CODEX_HOME` (else `~/.codex`).
 
 The names before the mechanisms were renamed are read too, so an existing config file keeps
 working: `inject` (microskills), `untool` (toolprune), `spiral` (loopguard), with their
